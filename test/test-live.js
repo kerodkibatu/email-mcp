@@ -53,7 +53,6 @@ async function runQuery(opts) {
   }
   const script = buildQueryScript({
     daslFilter: dasl,
-    folders: opts.folders || ['Inbox'],
     account: opts.account || '',
     limit,
     offset: opts.offset ?? 0,
@@ -169,15 +168,13 @@ async function t(name, fn) {
     if (!threw) throw new Error('expected error without allow_slow');
   });
 
-  await t('Sent folder query', async () => {
-    const r = await runQuery({ filter: {}, folders: ['Sent'], limit: 2 });
-    if (!Array.isArray(r.results)) throw new Error('no results');
-    // ok if empty
-  });
-
-  await t('multi-folder query (Inbox + Sent)', async () => {
-    const r = await runQuery({ filter: {}, folders: ['Inbox','Sent'], limit: 5 });
-    if (!Array.isArray(r.results)) throw new Error('no results');
+  await t('all-folders default scan returns results', async () => {
+    const r = await runQuery({ filter: {}, limit: 5 });
+    if (!Array.isArray(r.results) || r.results.length === 0) throw new Error('no results');
+    // total_matched should reflect more than a single folder when scanning all mail folders
+    if (typeof r.total_matched !== 'number' || r.total_matched < r.results.length) {
+      throw new Error('bad total_matched: ' + r.total_matched);
+    }
   });
 
   console.log(`\n${pass} passed, ${fail} failed`);

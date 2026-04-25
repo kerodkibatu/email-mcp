@@ -224,7 +224,7 @@ function psStringArray(arr) {
   return '@(' + arr.map(psString).join(',') + ')';
 }
 
-function buildQueryScript({ daslFilter, folders, account, limit, offset, order, fields }) {
+function buildQueryScript({ daslFilter, account, limit, offset, order, fields }) {
   const sortInfo = ORDER_MAP[order] || ORDER_MAP.received_desc;
   const sortDesc = sortInfo.desc ? '$true' : '$false';
   const sortProp = sortInfo.prop;
@@ -237,7 +237,6 @@ function buildQueryScript({ daslFilter, folders, account, limit, offset, order, 
 
   return `${INIT}
 $ErrorActionPreference = 'Continue'
-$folderNames = ${psStringArray(folders)}
 $accountFilter = ${psString(account || '')}
 $daslFilter = ${filterHere}
 $limit = ${Math.max(1, Math.min(500, limit))}
@@ -246,29 +245,38 @@ $sortProp = ${psString(sortProp)}
 $sortDesc = ${sortDesc}
 $fieldsList = ${psStringArray(fields)}
 
-$folderMap = @{ 'Inbox'=6; 'Sent'=5; 'Drafts'=16; 'Deleted'=3; 'Outbox'=4; 'Junk'=23; 'Archive'=23 }
-
 $stores = if ($accountFilter) {
   @($ns.Folders | Where-Object { $_.Name -like "*$accountFilter*" })
 } else {
-  @($ns.Folders.Item(1))
+  @($ns.Folders)
 }
 if (-not $stores -or $stores.Count -eq 0) { $stores = @($ns.Folders.Item(1)) }
+
+# Recursively collect all mail folders (DefaultItemType = 0 = olMail)
+function Get-MailFolders($parent) {
+  $list = New-Object System.Collections.ArrayList
+  try {
+    foreach ($f in $parent.Folders) {
+      try {
+        if ($f.DefaultItemType -eq 0) { [void]$list.Add($f) }
+      } catch {}
+      try {
+        foreach ($sub in (Get-MailFolders $f)) { [void]$list.Add($sub) }
+      } catch {}
+    }
+  } catch {}
+  return ,$list
+}
+
+$mailFolders = New-Object System.Collections.ArrayList
+foreach ($store in $stores) {
+  foreach ($mf in (Get-MailFolders $store)) { [void]$mailFolders.Add($mf) }
+}
 
 $allItems = New-Object System.Collections.ArrayList
 $totalMatched = 0
 
-foreach ($store in $stores) {
-  foreach ($fname in $folderNames) {
-    $f = $null
-    if ($folderMap.ContainsKey($fname)) {
-      try { $f = $ns.GetDefaultFolder($folderMap[$fname]) } catch {}
-    }
-    if (-not $f) {
-      $f = $store.Folders | Where-Object { $_.Name -like "*$fname*" } | Select-Object -First 1
-    }
-    if (-not $f) { continue }
-
+foreach ($f in $mailFolders) {
     $items = $f.Items
     try { $items.Sort("[$sortProp]", $sortDesc) } catch {}
 
@@ -292,11 +300,10 @@ foreach ($store in $stores) {
         $taken++
       } catch {}
     }
-  }
 }
 
 # Cross-folder final sort (Restrict+Sort was per-folder)
-if ($folderNames.Count -le 1) {
+if ($mailFolders.Count -le 1) {
   $sorted = $allItems
 } else {
   try {
@@ -363,7 +370,7 @@ const TOOLS = [
   },
   {
     name: 'query_emails',
-    description: `Query emails using a MongoDB-style filter tree. Single tool that replaces list+search.
+    description: `Query emails using a MongoDB-style filter tree. Searches across ALL mail folders by default (Inbox, Sent, Archive, custom, etc.).
 
 FIELDS (queryable): subject, from, from_name, to, cc, body (slow, requires allow_slow=true), received, sent, unread, has_attachments, importance, size.
 
@@ -387,8 +394,7 @@ EXAMPLE filter:
       properties: {
         filter: { type: 'object', description: 'Filter tree. Empty {} matches all.' },
         fields: { type: 'array', items: { type: 'string' }, description: 'Output fields. Default depends on limit.' },
-        folders: { type: 'array', items: { type: 'string' }, description: 'Folders to search (default ["Inbox"])' },
-        account: { type: 'string', description: 'Account email (substring match). Default: first account.' },
+        account: { type: 'string', description: 'Account email (substring match). Default: all accounts.' },
         limit: { type: 'number', description: 'Max results (default 20, max 500)' },
         offset: { type: 'number', description: 'Pagination offset' },
         order_by: { type: 'string', enum: Object.keys(ORDER_MAP), description: 'Sort order' },
@@ -485,7 +491,6 @@ $accounts | ConvertTo-Json -Depth 2 -Compress
       const limit  = typeof args.limit === 'number' ? args.limit : 20;
       const offset = typeof args.offset === 'number' ? args.offset : 0;
       const order  = args.order_by || 'received_desc';
-      const folders = Array.isArray(args.folders) && args.folders.length > 0 ? args.folders : ['Inbox'];
       const account = args.account || '';
       const allowSlow = !!args.allow_slow;
 
@@ -505,7 +510,6 @@ $accounts | ConvertTo-Json -Depth 2 -Compress
 
       const script = buildQueryScript({
         daslFilter: dasl,
-        folders,
         account,
         limit,
         offset,

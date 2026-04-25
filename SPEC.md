@@ -11,18 +11,20 @@ Replaces `list_emails` + `search_emails` with one expressive tool. MongoDB-style
 ## Tool signature
 
 ```
-query_emails(filter, fields?, folders?, accounts?, limit?, offset?, order_by?)
+query_emails(filter, fields?, account?, limit?, offset?, order_by?, allow_slow?)
 ```
 
 | Param | Type | Default |
 |---|---|---|
 | `filter` | object (operator tree, see below) | `{}` (matches all) |
 | `fields` | string[] | see "Default fields" |
-| `folders` | string[] | `["Inbox"]` |
-| `accounts` | string[] | first account |
+| `account` | string | all accounts |
 | `limit` | int | 20 (max 500) |
 | `offset` | int | 0 |
 | `order_by` | string | `"received_desc"` |
+| `allow_slow` | bool | false (required to query `body`) |
+
+**Folder scope:** searches **all mail folders** across the chosen account(s) — Inbox, Sent, Archive, custom folders, etc. (excludes Calendar/Contacts/Tasks). Walks subfolders recursively.
 
 ## Filter DSL
 
