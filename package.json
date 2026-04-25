@@ -1,0 +1,40 @@
+{
+  "name": "email-mcp",
+  "version": "1.0.0",
+  "description": "MCP server for email via classic Outlook (Windows COM) — no Azure required",
+  "main": "index.js",
+  "bin": {
+    "email-mcp": "index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "outlook",
+    "email",
+    "calendar",
+    "windows",
+    "com"
+  ],
+  "author": "Kerod Kibatu",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kerodkibatu/email-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kerodkibatu/email-mcp/issues"
+  },
+  "homepage": "https://github.com/kerodkibatu/email-mcp#readme",
+  "os": [
+    "win32"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
