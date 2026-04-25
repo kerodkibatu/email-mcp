@@ -442,6 +442,20 @@ EXAMPLE filter:
     },
   },
   {
+    name: 'forward_email',
+    description: 'Forward an email. Preserves the original subject (FW:), quoted body, and attachments.',
+    inputSchema: {
+      type: 'object',
+      required: ['entry_id', 'to'],
+      properties: {
+        entry_id: { type: 'string', description: 'EntryID of the email to forward' },
+        to: { type: 'string', description: 'Recipient email address (comma-separated for multiple)' },
+        cc: { type: 'string', description: 'CC recipients (comma-separated, optional)' },
+        body: { type: 'string', description: 'Optional message to prepend above the forwarded content' },
+      },
+    },
+  },
+  {
     name: 'mark_as_read',
     description: 'Mark an email as read or unread',
     inputSchema: {
@@ -583,6 +597,25 @@ $reply = if ($${replyAll}) { $item.ReplyAll() } else { $item.Reply() }
 $reply.Body = '${body}' + "\`r\`n\`r\`n" + $reply.Body
 $reply.Send()
 Write-Output '{"status":"sent"}'
+`);
+    }
+
+    case 'forward_email': {
+      const entryId = args.entry_id.replace(/'/g, "''");
+      const to = args.to.replace(/'/g, "''");
+      const cc = (args.cc || '').replace(/'/g, "''");
+      const body = (args.body || '').replace(/'/g, "''");
+
+      return await ps(`
+${INIT}
+$item = $ns.GetItemFromID('${entryId}')
+if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
+$fwd = $item.Forward()
+$fwd.To = '${to}'
+${cc ? `$fwd.CC = '${cc}'` : ''}
+${body ? `$fwd.Body = '${body}' + "\`r\`n\`r\`n" + $fwd.Body` : ''}
+$fwd.Send()
+Write-Output '{"status":"sent","to":"${to}"}'
 `);
     }
 
