@@ -23,7 +23,7 @@ async function ps(script) {
   try {
     const { stdout, stderr } = await execAsync(
       `powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`,
-      { timeout: 45000 }
+      { timeout: 60000, maxBuffer: 32 * 1024 * 1024 }
     );
     if (stderr && stderr.trim()) process.stderr.write('[ps stderr] ' + stderr + '\n');
     return stdout.trim();
@@ -32,7 +32,6 @@ async function ps(script) {
   }
 }
 
-// Shared Outlook COM init block â€” reused in every script
 const INIT = `
 $ErrorActionPreference = 'Stop'
 try {
@@ -43,6 +42,319 @@ try {
 $ns = $ol.GetNamespace('MAPI')
 `;
 
+// ---------- query_emails: filter tree -> DASL ----------
+
+const FIELD_DASL = {
+  subject:         'urn:schemas:httpmail:subject',
+  from:            'urn:schemas:httpmail:fromemail',
+  from_name:       'urn:schemas:httpmail:from',
+  to:              'urn:schemas:httpmail:to',
+  cc:              'urn:schemas:httpmail:cc',
+  body:            'urn:schemas:httpmail:textdescription',
+  received:        'urn:schemas:httpmail:datereceived',
+  sent:            'urn:schemas:mailheader:date',
+  unread:          'urn:schemas:httpmail:read',  // negated; unread=true => read=0
+  has_attachments: 'urn:schemas:httpmail:hasattachment',
+  importance:      'urn:schemas:httpmail:importance',
+  size:            'urn:schemas:httpmail:size',
+};
+
+const STRING_FIELDS = new Set(['subject', 'from', 'from_name', 'to', 'cc', 'body']);
+const DATE_FIELDS   = new Set(['received', 'sent']);
+const BOOL_FIELDS   = new Set(['unread', 'has_attachments']);
+const NUM_FIELDS    = new Set(['importance', 'size']);
+
+const SLOW_FIELDS   = new Set(['body']);
+
+function escSqlString(s) {
+  return String(s).replace(/'/g, "''");
+}
+function escLikeArg(s) {
+  // DASL LIKE wildcards: % and _; escape with [%] [_]
+  return escSqlString(s).replace(/%/g, '[%]').replace(/_/g, '[_]');
+}
+function fmtDate(v) {
+  // accept ISO 'YYYY-MM-DD' or 'YYYY-MM-DDTHH:mm[:ss]'
+  const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?/);
+  if (!m) throw new McpError(ErrorCode.InvalidParams, `Invalid date: ${v} (use YYYY-MM-DD or YYYY-MM-DDTHH:mm)`);
+  const [, y, mo, d, hh = '00', mm = '00'] = m;
+  return `${y}-${mo}-${d} ${hh}:${mm}`;
+}
+function fmtBool(v) { return v ? '1' : '0'; }
+function fmtNum(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) throw new McpError(ErrorCode.InvalidParams, `Invalid number: ${v}`);
+  return String(n);
+}
+
+function fmtValue(field, v) {
+  if (STRING_FIELDS.has(field)) return `'${escSqlString(v)}'`;
+  if (DATE_FIELDS.has(field))   return `'${fmtDate(v)}'`;
+  if (BOOL_FIELDS.has(field))   return fmtBool(v);
+  if (NUM_FIELDS.has(field))    return fmtNum(v);
+  throw new McpError(ErrorCode.InvalidParams, `Unsupported field: ${field}`);
+}
+
+// `unread` is stored as `read` (negated). Translate the operator/value when emitting.
+function negateBoolValue(v) { return v ? '0' : '1'; }
+
+function compilePredicate(field, opOrVal, opts) {
+  const dasl = FIELD_DASL[field];
+  if (!dasl) throw new McpError(ErrorCode.InvalidParams, `Unknown field: ${field}`);
+  if (SLOW_FIELDS.has(field) && !opts.allow_slow) {
+    throw new McpError(ErrorCode.InvalidParams,
+      `Field '${field}' is slow (full-text scan). Pass allow_slow: true to opt in.`);
+  }
+
+  const prop = `"${dasl}"`;
+  const isUnread = field === 'unread';
+
+  // Bare value -> $eq
+  if (opOrVal === null || typeof opOrVal !== 'object' || Array.isArray(opOrVal)) {
+    if (Array.isArray(opOrVal)) {
+      // bare array -> $in
+      return compileOp(prop, field, '$in', opOrVal, isUnread);
+    }
+    return compileOp(prop, field, '$eq', opOrVal, isUnread);
+  }
+
+  const keys = Object.keys(opOrVal);
+  if (keys.length === 0) {
+    throw new McpError(ErrorCode.InvalidParams, `Empty operator object for field: ${field}`);
+  }
+  // multiple operators on same field => AND them
+  const parts = keys.map(op => compileOp(prop, field, op, opOrVal[op], isUnread));
+  return parts.length === 1 ? parts[0] : `(${parts.join(' AND ')})`;
+}
+
+function compileOp(prop, field, op, val, isUnread) {
+  const v = (raw) => fmtValue(field, raw);
+  const vUnread = (raw) => negateBoolValue(raw);
+
+  switch (op) {
+    case '$eq':
+      if (isUnread) return `${prop} = ${vUnread(val)}`;
+      return `${prop} = ${v(val)}`;
+    case '$ne':
+      if (isUnread) return `${prop} <> ${vUnread(val)}`;
+      return `${prop} <> ${v(val)}`;
+    case '$in': {
+      if (!Array.isArray(val) || val.length === 0)
+        return `1 = 0`; // empty $in matches nothing
+      const parts = val.map(x => `${prop} = ${isUnread ? vUnread(x) : v(x)}`);
+      return `(${parts.join(' OR ')})`;
+    }
+    case '$nin': {
+      if (!Array.isArray(val) || val.length === 0) return `1 = 1`;
+      const parts = val.map(x => `${prop} <> ${isUnread ? vUnread(x) : v(x)}`);
+      return `(${parts.join(' AND ')})`;
+    }
+    case '$contains':
+      if (!STRING_FIELDS.has(field)) throw new McpError(ErrorCode.InvalidParams, `$contains requires string field: ${field}`);
+      return `${prop} LIKE '%${escLikeArg(val)}%'`;
+    case '$not_contains':
+      if (!STRING_FIELDS.has(field)) throw new McpError(ErrorCode.InvalidParams, `$not_contains requires string field: ${field}`);
+      return `NOT (${prop} LIKE '%${escLikeArg(val)}%')`;
+    case '$starts_with':
+      if (!STRING_FIELDS.has(field)) throw new McpError(ErrorCode.InvalidParams, `$starts_with requires string field: ${field}`);
+      return `${prop} LIKE '${escLikeArg(val)}%'`;
+    case '$ends_with':
+      if (!STRING_FIELDS.has(field)) throw new McpError(ErrorCode.InvalidParams, `$ends_with requires string field: ${field}`);
+      return `${prop} LIKE '%${escLikeArg(val)}'`;
+    case '$gte': return `${prop} >= ${v(val)}`;
+    case '$lte': return `${prop} <= ${v(val)}`;
+    case '$gt':  return `${prop} > ${v(val)}`;
+    case '$lt':  return `${prop} < ${v(val)}`;
+    case '$exists':
+      return val ? `${prop} IS NOT NULL` : `${prop} IS NULL`;
+    default:
+      throw new McpError(ErrorCode.InvalidParams, `Unknown operator: ${op}`);
+  }
+}
+
+function compileFilter(node, opts) {
+  if (!node || typeof node !== 'object' || Array.isArray(node)) {
+    throw new McpError(ErrorCode.InvalidParams, `Filter must be an object`);
+  }
+  const keys = Object.keys(node);
+  if (keys.length === 0) return ''; // empty filter = match all
+
+  const parts = keys.map(k => {
+    if (k === '$and' || k === '$or') {
+      if (!Array.isArray(node[k])) throw new McpError(ErrorCode.InvalidParams, `${k} requires an array`);
+      if (node[k].length === 0) return k === '$and' ? '1 = 1' : '1 = 0';
+      const sub = node[k].map(c => compileFilter(c, opts)).filter(s => s.length > 0);
+      if (sub.length === 0) return '';
+      const joiner = k === '$and' ? ' AND ' : ' OR ';
+      return sub.length === 1 ? sub[0] : `(${sub.map(s => `(${s})`).join(joiner)})`;
+    }
+    if (k === '$not') {
+      const inner = compileFilter(node[k], opts);
+      if (!inner) return '';
+      return `NOT (${inner})`;
+    }
+    // field predicate
+    return compilePredicate(k, node[k], opts);
+  }).filter(s => s.length > 0);
+
+  if (parts.length === 0) return '';
+  return parts.length === 1 ? parts[0] : parts.map(p => `(${p})`).join(' AND ');
+}
+
+// ---------- query_emails: PowerShell builder ----------
+
+const ORDER_MAP = {
+  received_desc: { prop: 'ReceivedTime', desc: true  },
+  received_asc:  { prop: 'ReceivedTime', desc: false },
+  sent_desc:     { prop: 'SentOn',       desc: true  },
+  sent_asc:      { prop: 'SentOn',       desc: false },
+  subject_asc:   { prop: 'Subject',      desc: false },
+};
+
+const VALID_FIELDS_OUT = new Set([
+  'entry_id','subject','from','from_name','to','cc','received','sent',
+  'unread','has_attachments','preview','importance','size'
+]);
+
+function psString(s) {
+  // for single-quoted PS string literal: escape single quotes
+  return `'${String(s).replace(/'/g, "''")}'`;
+}
+function psStringArray(arr) {
+  return '@(' + arr.map(psString).join(',') + ')';
+}
+
+function buildQueryScript({ daslFilter, folders, account, limit, offset, order, fields }) {
+  const sortInfo = ORDER_MAP[order] || ORDER_MAP.received_desc;
+  const sortDesc = sortInfo.desc ? '$true' : '$false';
+  const sortProp = sortInfo.prop;
+
+  // Use a here-string for the DASL so we don't have to worry about embedded quotes.
+  const filterClause = daslFilter ? `@SQL=${daslFilter}` : '';
+  const filterHere = filterClause
+    ? `@'\n${filterClause}\n'@`
+    : `''`;
+
+  return `${INIT}
+$ErrorActionPreference = 'Continue'
+$folderNames = ${psStringArray(folders)}
+$accountFilter = ${psString(account || '')}
+$daslFilter = ${filterHere}
+$limit = ${Math.max(1, Math.min(500, limit))}
+$offset = ${Math.max(0, offset)}
+$sortProp = ${psString(sortProp)}
+$sortDesc = ${sortDesc}
+$fieldsList = ${psStringArray(fields)}
+
+$folderMap = @{ 'Inbox'=6; 'Sent'=5; 'Drafts'=16; 'Deleted'=3; 'Outbox'=4; 'Junk'=23; 'Archive'=23 }
+
+$stores = if ($accountFilter) {
+  @($ns.Folders | Where-Object { $_.Name -like "*$accountFilter*" })
+} else {
+  @($ns.Folders.Item(1))
+}
+if (-not $stores -or $stores.Count -eq 0) { $stores = @($ns.Folders.Item(1)) }
+
+$allItems = New-Object System.Collections.ArrayList
+$totalMatched = 0
+
+foreach ($store in $stores) {
+  foreach ($fname in $folderNames) {
+    $f = $null
+    if ($folderMap.ContainsKey($fname)) {
+      try { $f = $ns.GetDefaultFolder($folderMap[$fname]) } catch {}
+    }
+    if (-not $f) {
+      $f = $store.Folders | Where-Object { $_.Name -like "*$fname*" } | Select-Object -First 1
+    }
+    if (-not $f) { continue }
+
+    $items = $f.Items
+    try { $items.Sort("[$sortProp]", $sortDesc) } catch {}
+
+    if ($daslFilter -and $daslFilter.Trim().Length -gt 0) {
+      try { $items = $items.Restrict($daslFilter) } catch {
+        [System.Console]::Error.WriteLine("Restrict failed in folder " + $f.Name + ": " + $_.Exception.Message)
+        continue
+      }
+    }
+
+    try { $totalMatched += [int]$items.Count } catch {}
+
+    # Take only what we need from each folder (already sorted via COM Sort)
+    $perFolderCap = $offset + $limit
+    $taken = 0
+    foreach ($item in $items) {
+      if ($taken -ge $perFolderCap) { break }
+      try {
+        if ($item.Class -ne 43) { continue }   # 43 = olMail
+        [void]$allItems.Add($item)
+        $taken++
+      } catch {}
+    }
+  }
+}
+
+# Cross-folder final sort (Restrict+Sort was per-folder)
+if ($folderNames.Count -le 1) {
+  $sorted = $allItems
+} else {
+  try {
+    if ($sortProp -eq 'ReceivedTime') {
+      $sorted = if ($sortDesc) { $allItems | Sort-Object -Property ReceivedTime -Descending } else { $allItems | Sort-Object -Property ReceivedTime }
+    } elseif ($sortProp -eq 'SentOn') {
+      $sorted = if ($sortDesc) { $allItems | Sort-Object -Property SentOn -Descending } else { $allItems | Sort-Object -Property SentOn }
+    } else {
+      $sorted = if ($sortDesc) { $allItems | Sort-Object -Property Subject -Descending } else { $allItems | Sort-Object -Property Subject }
+    }
+  } catch { $sorted = $allItems }
+}
+
+$sliced = @($sorted) | Select-Object -Skip $offset -First $limit
+
+function Get-Field($i, $f) {
+  switch ($f) {
+    'entry_id'        { try { return $i.EntryID } catch { return '' } }
+    'subject'         { try { return $i.Subject } catch { return '' } }
+    'from'            { try { return $i.SenderEmailAddress } catch { return '' } }
+    'from_name'       { try { return $i.SenderName } catch { return '' } }
+    'to'              { try { return $i.To } catch { return '' } }
+    'cc'              { try { return $i.CC } catch { return '' } }
+    'received'        { try { if ($i.ReceivedTime) { return $i.ReceivedTime.ToString('yyyy-MM-dd HH:mm') } } catch {}; return '' }
+    'sent'            { try { if ($i.SentOn) { return $i.SentOn.ToString('yyyy-MM-dd HH:mm') } } catch {}; return '' }
+    'unread'          { try { return [bool]$i.UnRead } catch { return $false } }
+    'has_attachments' { try { return ($i.Attachments.Count -gt 0) } catch { return $false } }
+    'preview'         { try { if ($i.Body) { return $i.Body.Substring(0, [Math]::Min(150, $i.Body.Length)).Trim() } } catch {}; return '' }
+    'importance'      { try { return [int]$i.Importance } catch { return 1 } }
+    'size'            { try { return [int]$i.Size } catch { return 0 } }
+  }
+}
+
+$results = @()
+foreach ($i in $sliced) {
+  $obj = [ordered]@{}
+  foreach ($f in $fieldsList) {
+    $obj[$f] = Get-Field $i $f
+  }
+  $results += [PSCustomObject]$obj
+}
+
+$hasMore = $totalMatched -gt ($offset + $limit)
+$nextOffset = if ($hasMore) { $offset + $limit } else { $null }
+
+$output = [PSCustomObject]@{
+  results = @($results)
+  total_returned = @($results).Count
+  total_matched = $totalMatched
+  has_more = $hasMore
+  next_offset = $nextOffset
+}
+$output | ConvertTo-Json -Depth 4 -Compress
+`;
+}
+
+// ---------- TOOLS ----------
+
 const TOOLS = [
   {
     name: 'list_accounts',
@@ -50,15 +362,37 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
-    name: 'list_emails',
-    description: 'List recent emails from a folder. Defaults to Inbox of first account.',
+    name: 'query_emails',
+    description: `Query emails using a MongoDB-style filter tree. Single tool that replaces list+search.
+
+FIELDS (queryable): subject, from, from_name, to, cc, body (slow, requires allow_slow=true), received, sent, unread, has_attachments, importance, size.
+
+OPERATORS: $eq $ne $in $nin $contains $not_contains $starts_with $ends_with $gte $lte $gt $lt $exists.
+COMBINATORS: $and $or $not.
+
+DATES: ISO format ("2026-01-25" or "2026-01-25T14:30").
+
+DEFAULT FIELDS in response: small queries (limit <= 20) include entry_id; larger scans omit it for token efficiency. Override with the 'fields' param.
+
+PATTERN: For broad searches, scan first with limit > 20 (no entry_ids), then re-query narrowly to get entry_ids for the specific items you want to act on (read/reply/mark).
+
+EXAMPLE filter:
+  { "$and": [
+      { "from": { "$in": ["a@x.com","b@x.com"] } },
+      { "subject": { "$contains": "report" } },
+      { "received": { "$gte": "2026-01-01" } }
+  ]}`,
     inputSchema: {
       type: 'object',
       properties: {
-        account: { type: 'string', description: 'Account email address (optional, defaults to first account)' },
-        folder: { type: 'string', description: 'Folder name: Inbox, Sent, Drafts, Deleted (default: Inbox)' },
-        count: { type: 'number', description: 'Number of emails to return (default: 20, max: 50)' },
-        unread_only: { type: 'boolean', description: 'Return only unread emails (default: false)' },
+        filter: { type: 'object', description: 'Filter tree. Empty {} matches all.' },
+        fields: { type: 'array', items: { type: 'string' }, description: 'Output fields. Default depends on limit.' },
+        folders: { type: 'array', items: { type: 'string' }, description: 'Folders to search (default ["Inbox"])' },
+        account: { type: 'string', description: 'Account email (substring match). Default: first account.' },
+        limit: { type: 'number', description: 'Max results (default 20, max 500)' },
+        offset: { type: 'number', description: 'Pagination offset' },
+        order_by: { type: 'string', enum: Object.keys(ORDER_MAP), description: 'Sort order' },
+        allow_slow: { type: 'boolean', description: 'Required to query the body field' },
       },
     },
   },
@@ -69,20 +403,7 @@ const TOOLS = [
       type: 'object',
       required: ['entry_id'],
       properties: {
-        entry_id: { type: 'string', description: 'The EntryID of the email (from list_emails)' },
-      },
-    },
-  },
-  {
-    name: 'search_emails',
-    description: 'Search emails across all folders by subject, sender, or body keyword',
-    inputSchema: {
-      type: 'object',
-      required: ['query'],
-      properties: {
-        query: { type: 'string', description: 'Search term to look for in subject, sender, or body' },
-        account: { type: 'string', description: 'Limit search to a specific account email (optional)' },
-        count: { type: 'number', description: 'Max results to return (default: 15)' },
+        entry_id: { type: 'string', description: 'The EntryID of the email (from query_emails)' },
       },
     },
   },
@@ -140,6 +461,8 @@ const TOOLS = [
   },
 ];
 
+// ---------- handlers ----------
+
 async function handleTool(name, args) {
   switch (name) {
     case 'list_accounts': {
@@ -152,70 +475,45 @@ foreach ($store in $ns.Folders) {
     entry_id = $store.EntryID
   }
 }
-$accounts | ConvertTo-Json -Depth 2
+$accounts | ConvertTo-Json -Depth 2 -Compress
 `);
       return result || '[]';
     }
 
-    case 'list_emails': {
-      const folder = (args.folder || 'Inbox').replace(/'/g, "''");
-      const count = Math.min(args.count || 20, 50);
-      const account = args.account ? args.account.replace(/'/g, "''") : '';
-      const unreadOnly = args.unread_only ? 'true' : 'false';
+    case 'query_emails': {
+      const filter = args.filter || {};
+      const limit  = typeof args.limit === 'number' ? args.limit : 20;
+      const offset = typeof args.offset === 'number' ? args.offset : 0;
+      const order  = args.order_by || 'received_desc';
+      const folders = Array.isArray(args.folders) && args.folders.length > 0 ? args.folders : ['Inbox'];
+      const account = args.account || '';
+      const allowSlow = !!args.allow_slow;
 
-      const result = await ps(`
-${INIT}
-$folderMap = @{ 'Inbox'=6; 'Sent'=5; 'Drafts'=16; 'Deleted'=3; 'Outbox'=4; 'Junk'=23 }
-$folderName = '${folder}'
-$targetAccount = '${account}'
-$unreadOnly = $${unreadOnly}
-$count = ${count}
+      // default fields
+      let fields;
+      if (Array.isArray(args.fields) && args.fields.length > 0) {
+        const bad = args.fields.filter(f => !VALID_FIELDS_OUT.has(f));
+        if (bad.length) throw new McpError(ErrorCode.InvalidParams, `Unknown output field(s): ${bad.join(', ')}. Valid: ${[...VALID_FIELDS_OUT].join(', ')}`);
+        fields = args.fields;
+      } else if (limit <= 20) {
+        fields = ['entry_id','subject','from','received','unread','has_attachments'];
+      } else {
+        fields = ['subject','from','received'];
+      }
 
-if ($targetAccount) {
-  $store = $ns.Folders | Where-Object { $_.Name -like "*$targetAccount*" } | Select-Object -First 1
-  if (-not $store) { $store = $ns.Folders.Item(1) }
-} else {
-  $store = $ns.Folders.Item(1)
-}
+      const dasl = compileFilter(filter, { allow_slow: allowSlow });
 
-if ($folderMap.ContainsKey($folderName)) {
-  $mf = $store.Folders | Where-Object { $folderMap[$folderName] -ne $null } | Select-Object -First 1
-  # Try by well-known index first
-  try {
-    $mf = $ns.GetDefaultFolder($folderMap[$folderName])
-  } catch {
-    $mf = $store.Folders | Where-Object { $_.Name -like "*$folderName*" } | Select-Object -First 1
-  }
-} else {
-  $mf = $store.Folders | Where-Object { $_.Name -like "*$folderName*" } | Select-Object -First 1
-}
+      const script = buildQueryScript({
+        daslFilter: dasl,
+        folders,
+        account,
+        limit,
+        offset,
+        order,
+        fields,
+      });
 
-if (-not $mf) { Write-Output '[]'; exit 0 }
-
-$items = $mf.Items
-$items.Sort('[ReceivedTime]', $true)
-
-$emails = @()
-$i = 1
-foreach ($item in $items) {
-  if ($emails.Count -ge $count) { break }
-  if ($unreadOnly -and $item.UnRead -eq $false) { $i++; continue }
-  if ($item.Class -ne 43) { $i++; continue }  # 43 = olMail
-  $emails += [PSCustomObject]@{
-    entry_id      = $item.EntryID
-    subject       = $item.Subject
-    from          = $item.SenderEmailAddress
-    from_name     = $item.SenderName
-    received      = $item.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
-    unread        = $item.UnRead
-    has_attachments = $item.Attachments.Count -gt 0
-    preview       = $item.Body.Substring(0, [Math]::Min(200, $item.Body.Length)).Trim()
-  }
-  $i++
-}
-$emails | ConvertTo-Json -Depth 2
-`);
-      return result || '[]';
+      return await ps(script);
     }
 
     case 'read_email': {
@@ -237,53 +535,7 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
   has_attachments = $item.Attachments.Count -gt 0
   attachments     = @($item.Attachments | ForEach-Object { $_.FileName })
   body            = $item.Body
-} | ConvertTo-Json -Depth 3
-`);
-    }
-
-    case 'search_emails': {
-      const query = args.query.replace(/'/g, "''").replace(/"/g, '""');
-      const count = Math.min(args.count || 15, 30);
-      const account = args.account ? args.account.replace(/'/g, "''") : '';
-
-      return await ps(`
-${INIT}
-$query = '${query}'
-$maxResults = ${count}
-$targetAccount = '${account}'
-$results = @()
-
-$stores = if ($targetAccount) {
-  $ns.Folders | Where-Object { $_.Name -like "*$targetAccount*" }
-} else {
-  $ns.Folders
-}
-
-foreach ($store in $stores) {
-  foreach ($folder in $store.Folders) {
-    if ($results.Count -ge $maxResults) { break }
-    try {
-      $filter = "@SQL=""urn:schemas:httpmail:subject"" LIKE '%${query}%' OR ""urn:schemas:httpmail:fromemail"" LIKE '%${query}%' OR ""urn:schemas:httpmail:textdescription"" LIKE '%${query}%'"
-      $found = $folder.Items.Restrict($filter)
-      foreach ($item in $found) {
-        if ($results.Count -ge $maxResults) { break }
-        if ($item.Class -ne 43) { continue }
-        $results += [PSCustomObject]@{
-          entry_id  = $item.EntryID
-          subject   = $item.Subject
-          from      = $item.SenderEmailAddress
-          from_name = $item.SenderName
-          received  = $item.ReceivedTime.ToString('yyyy-MM-dd HH:mm')
-          folder    = $folder.Name
-          unread    = $item.UnRead
-          preview   = $item.Body.Substring(0, [Math]::Min(150, $item.Body.Length)).Trim()
-        }
-      }
-    } catch {}
-  }
-  if ($results.Count -ge $maxResults) { break }
-}
-$results | ConvertTo-Json -Depth 2
+} | ConvertTo-Json -Depth 3 -Compress
 `);
     }
 
@@ -296,7 +548,7 @@ $results | ConvertTo-Json -Depth 2
 
       return await ps(`
 ${INIT}
-$mail = $ol.CreateItem(0)  # 0 = olMailItem
+$mail = $ol.CreateItem(0)
 $mail.Subject = '${subject}'
 $mail.Body = '${body}'
 $mail.To = '${to}'
@@ -324,9 +576,9 @@ ${INIT}
 $item = $ns.GetItemFromID('${entryId}')
 if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
 $reply = if ($${replyAll}) { $item.ReplyAll() } else { $item.Reply() }
-$reply.Body = '${body}' + "\r\n\r\n" + $reply.Body
+$reply.Body = '${body}' + "\`r\`n\`r\`n" + $reply.Body
 $reply.Send()
-Write-Output '{"status":"sent","reply_to":"' + $item.Subject + '"}'
+Write-Output '{"status":"sent"}'
 `);
     }
 
@@ -385,7 +637,7 @@ foreach ($e in $events) {
     body       = $e.Body.Substring(0, [Math]::Min(200, $e.Body.Length)).Trim()
   }
 }
-$results | ConvertTo-Json -Depth 2
+$results | ConvertTo-Json -Depth 2 -Compress
 `);
     }
 
@@ -412,13 +664,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  process.stderr.write('email MCP server running\n');
-}
+// ---------- exports for testing ----------
+module.exports = { compileFilter, buildQueryScript };
 
-main().catch((err) => {
-  process.stderr.write('Fatal: ' + err.message + '\n');
-  process.exit(1);
-});
+if (require.main === module) {
+  (async () => {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    process.stderr.write('email MCP server running\n');
+  })().catch((err) => {
+    process.stderr.write('Fatal: ' + err.message + '\n');
+    process.exit(1);
+  });
+}

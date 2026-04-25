@@ -2,3 +2,6 @@ node_modules/
 *.log
 .DS_Store
 .env
+test/dbg*.ps1
+test/dbg*.out
+test/live-out.txt
