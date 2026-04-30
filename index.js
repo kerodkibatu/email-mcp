@@ -17,16 +17,29 @@ const path = require('path');
 
 const execAsync = promisify(exec);
 
+function textToHtml(s) {
+  const escaped = String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+  return escaped.replace(/\r\n|\r|\n/g, '<br>');
+}
+
 async function ps(script) {
   const tmp = path.join(os.tmpdir(), `email-mcp-${Date.now()}-${Math.random().toString(36).slice(2)}.ps1`);
-  fs.writeFileSync(tmp, script, 'utf8');
+  fs.writeFileSync(tmp, '﻿' + script, 'utf8');
   try {
     const { stdout, stderr } = await execAsync(
       `powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`,
-      { timeout: 60000, maxBuffer: 32 * 1024 * 1024 }
+      { timeout: 60000, maxBuffer: 32 * 1024 * 1024, encoding: 'buffer' }
     );
-    if (stderr && stderr.trim()) process.stderr.write('[ps stderr] ' + stderr + '\n');
-    return stdout.trim();
+    if (stderr && stderr.length) {
+      const errText = Buffer.isBuffer(stderr) ? stderr.toString('utf8') : stderr;
+      if (errText.trim()) process.stderr.write('[ps stderr] ' + errText + '\n');
+    }
+    const out = Buffer.isBuffer(stdout) ? stdout.toString('utf8') : stdout;
+    return out.trim();
   } finally {
     try { fs.unlinkSync(tmp); } catch {}
   }
@@ -34,6 +47,9 @@ async function ps(script) {
 
 const INIT = `
 $ErrorActionPreference = 'Stop'
+# Force UTF-8 on stdout so Node sees Unicode chars intact
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 try {
   $ol = [System.Runtime.InteropServices.Marshal]::GetActiveObject('Outlook.Application')
 } catch {
@@ -559,34 +575,40 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
 
     case 'send_email': {
       const to = args.to.replace(/'/g, "''");
-      const subject = args.subject.replace(/'/g, "''");
-      const body = args.body.replace(/'/g, "''");
+      const subjectB64 = Buffer.from(args.subject, 'utf8').toString('base64');
+      const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body)}</div>`, 'utf8').toString('base64');
       const cc = (args.cc || '').replace(/'/g, "''");
       const account = (args.account || '').replace(/'/g, "''");
 
       return await ps(`
 ${INIT}
 $mail = $ol.CreateItem(0)
-$mail.Subject = '${subject}'
-$mail.Body = '${body}'
+$mail.Subject = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${subjectB64}'))
+$mail.HTMLBody = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${htmlBodyB64}'))
 $mail.To = '${to}'
 ${cc ? `$mail.CC = '${cc}'` : ''}
 ${account ? `
 $accts = $ol.Session.Accounts
+$matched = $null
 foreach ($acct in $accts) {
-  if ($acct.SmtpAddress -like '*${account}*') {
-    $mail.SendUsingAccount = $acct
-    break
-  }
-}` : ''}
+  if ($acct.SmtpAddress -like '*${account}*') { $matched = $acct; break }
+}
+if (-not $matched) {
+  Write-Output ('{"error":"Account not found: ${account}"}')
+  exit 0
+}
+# Direct property assignment is silently ignored by Outlook COM; must use reflection.
+[System.Type]$t = $mail.GetType()
+[void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $mail, @($matched))
+$sentFrom = $mail.SendUsingAccount.SmtpAddress` : '$sentFrom = $ol.Session.CurrentUser.Address'}
 $mail.Send()
-Write-Output '{"status":"sent","to":"${to}","subject":"${subject}"}'
+Write-Output ('{"status":"sent","to":"${to}","from":"' + $sentFrom + '"}')
 `);
     }
 
     case 'reply_email': {
       const entryId = args.entry_id.replace(/'/g, "''");
-      const body = args.body.replace(/'/g, "''");
+      const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body)}</div>`, 'utf8').toString('base64');
       const replyAll = args.reply_all ? 'true' : 'false';
 
       return await ps(`
@@ -594,7 +616,8 @@ ${INIT}
 $item = $ns.GetItemFromID('${entryId}')
 if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
 $reply = if ($${replyAll}) { $item.ReplyAll() } else { $item.Reply() }
-$reply.Body = '${body}' + "\`r\`n\`r\`n" + $reply.Body
+$html = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${htmlBodyB64}'))
+$reply.HTMLBody = $html + $reply.HTMLBody
 $reply.Send()
 Write-Output '{"status":"sent"}'
 `);
@@ -604,7 +627,7 @@ Write-Output '{"status":"sent"}'
       const entryId = args.entry_id.replace(/'/g, "''");
       const to = args.to.replace(/'/g, "''");
       const cc = (args.cc || '').replace(/'/g, "''");
-      const body = (args.body || '').replace(/'/g, "''");
+      const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body || '')}</div>`, 'utf8').toString('base64');
 
       return await ps(`
 ${INIT}
@@ -613,7 +636,8 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
 $fwd = $item.Forward()
 $fwd.To = '${to}'
 ${cc ? `$fwd.CC = '${cc}'` : ''}
-${body ? `$fwd.Body = '${body}' + "\`r\`n\`r\`n" + $fwd.Body` : ''}
+${args.body ? `$html = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${htmlBodyB64}'))
+$fwd.HTMLBody = $html + $fwd.HTMLBody` : ''}
 $fwd.Send()
 Write-Output '{"status":"sent","to":"${to}"}'
 `);
