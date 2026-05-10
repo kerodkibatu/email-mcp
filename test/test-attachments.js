@@ -86,6 +86,84 @@ function skipIf(cond, msg) { if (cond) { const e = new Error(msg); e.skip = true
     if (!script.includes("'C:\\tmp\\dl'")) throw new Error('downloadsRoot not embedded: ' + script.slice(0, 200));
   });
 
+  // --- Live tests against Outlook ---
+  // These require a running Outlook profile and seed env vars.
+
+  const SEED_ENTRY_ID = process.env.ATTACH_TEST_ENTRY_ID;
+  const INLINE_ONLY_ENTRY_ID = process.env.ATTACH_TEST_INLINE_ONLY_ENTRY_ID;
+  const BAD_ENTRY_ID = '0000000000000000000000000000000000000000000000000000000000000000';
+
+  async function callDownload(entryId, includeInline) {
+    const script = buildDownloadScript({
+      entryId,
+      includeInline: !!includeInline,
+      downloadsRoot: DOWNLOADS_ROOT,
+    });
+    const out = await ps(script);
+    return JSON.parse(out);
+  }
+
+  await t('bad entry_id returns {error}', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    const r = await callDownload(BAD_ENTRY_ID, false);
+    if (r.error !== 'Email not found') throw new Error('expected Email not found, got: ' + JSON.stringify(r));
+  });
+
+  await t('seed email saves at least one real attachment', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    skipIf(!SEED_ENTRY_ID, 'set ATTACH_TEST_ENTRY_ID env var');
+    const r = await callDownload(SEED_ENTRY_ID, false);
+    if (r.error) throw new Error('unexpected error: ' + r.error);
+    if (!r.folder) throw new Error('expected folder path, got: ' + JSON.stringify(r));
+    if (!Array.isArray(r.saved) || r.saved.length === 0) {
+      throw new Error('expected at least one saved file: ' + JSON.stringify(r));
+    }
+    // Verify files exist on disk and sizes are non-zero
+    for (const s of r.saved) {
+      const full = path.join(r.folder, s.filename);
+      if (!fs.existsSync(full)) throw new Error('file missing on disk: ' + full);
+      const st = fs.statSync(full);
+      if (st.size === 0 && !s.error) throw new Error('zero-byte file with no error: ' + full);
+    }
+    // Marker file should exist
+    if (!fs.existsSync(path.join(r.folder, '.entry_id'))) {
+      throw new Error('.entry_id marker missing in ' + r.folder);
+    }
+  });
+
+  await t('inline-only email returns saved=[] with skipped_inline > 0', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    skipIf(!INLINE_ONLY_ENTRY_ID, 'set ATTACH_TEST_INLINE_ONLY_ENTRY_ID env var');
+    const r = await callDownload(INLINE_ONLY_ENTRY_ID, false);
+    if (r.error) throw new Error('unexpected error: ' + r.error);
+    if (r.folder !== null) throw new Error('expected folder=null when nothing saved, got: ' + r.folder);
+    if (!Array.isArray(r.saved) || r.saved.length !== 0) {
+      throw new Error('expected saved=[], got: ' + JSON.stringify(r.saved));
+    }
+    if (typeof r.skipped_inline !== 'number' || r.skipped_inline < 1) {
+      throw new Error('expected skipped_inline >= 1, got: ' + r.skipped_inline);
+    }
+  });
+
+  await t('include_inline=true saves inline images too', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    skipIf(!INLINE_ONLY_ENTRY_ID, 'set ATTACH_TEST_INLINE_ONLY_ENTRY_ID env var');
+    const r = await callDownload(INLINE_ONLY_ENTRY_ID, true);
+    if (r.error) throw new Error('unexpected error: ' + r.error);
+    if (!r.folder) throw new Error('expected folder path with include_inline=true');
+    if (!Array.isArray(r.saved) || r.saved.length === 0) {
+      throw new Error('expected at least one saved file with include_inline=true');
+    }
+  });
+
+  await t('re-download is idempotent (same folder, no hash suffix)', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    skipIf(!SEED_ENTRY_ID, 'set ATTACH_TEST_ENTRY_ID env var');
+    const r1 = await callDownload(SEED_ENTRY_ID, false);
+    const r2 = await callDownload(SEED_ENTRY_ID, false);
+    if (r1.folder !== r2.folder) throw new Error('expected same folder on re-download: ' + r1.folder + ' vs ' + r2.folder);
+  });
+
   console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped`);
   process.exit(fail > 0 ? 1 : 0);
 })();

@@ -388,7 +388,11 @@ $entryId = '${safeEntryId}'
 $downloadsRoot = '${safeRoot}'
 $includeInline = ${incl}
 
-$item = $ns.GetItemFromID($entryId)
+try {
+  $item = $ns.GetItemFromID($entryId)
+} catch {
+  Write-Output '{"error":"Email not found"}'; exit 0
+}
 if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
 
 # --- 1. Decide which attachments are inline ---
