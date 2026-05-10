@@ -20,7 +20,7 @@ const DOWNLOADS_ROOT = path.join(REPO_ROOT, 'downloads');
 
 async function ps(script) {
   const tmp = path.join(os.tmpdir(), `email-mcp-test-${Date.now()}-${Math.random().toString(36).slice(2)}.ps1`);
-  fs.writeFileSync(tmp, '﻿' + script, 'utf8');
+  fs.writeFileSync(tmp, '\uFEFF' + script, 'utf8');
   try {
     const { stdout, stderr } = await execAsync(
       `powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`,
