@@ -5,3 +5,5 @@ node_modules/
 test/dbg*.ps1
 test/dbg*.out
 test/live-out.txt
+
+downloads/
