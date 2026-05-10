@@ -62,6 +62,30 @@ function skipIf(cond, msg) { if (cond) { const e = new Error(msg); e.skip = true
     skipIf(!buildDownloadScript, 'buildDownloadScript not exported yet (Task 2 implements it)');
   });
 
+  await t('buildDownloadScript escapes single quotes in entry_id', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    const script = buildDownloadScript({
+      entryId: "abc'def",
+      includeInline: false,
+      downloadsRoot: DOWNLOADS_ROOT,
+    });
+    if (!script.includes("abc''def")) throw new Error('entry_id quote not escaped: ' + script.slice(0, 200));
+  });
+
+  await t('buildDownloadScript embeds includeInline as $true/$false literal', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    const yes = buildDownloadScript({ entryId: 'x', includeInline: true,  downloadsRoot: DOWNLOADS_ROOT });
+    const no  = buildDownloadScript({ entryId: 'x', includeInline: false, downloadsRoot: DOWNLOADS_ROOT });
+    if (!/\$includeInline\s*=\s*\$true/.test(yes))  throw new Error('expected $includeInline = $true in yes-script');
+    if (!/\$includeInline\s*=\s*\$false/.test(no))  throw new Error('expected $includeInline = $false in no-script');
+  });
+
+  await t('buildDownloadScript embeds the absolute downloadsRoot', async () => {
+    skipIf(!buildDownloadScript, 'not implemented');
+    const script = buildDownloadScript({ entryId: 'x', includeInline: false, downloadsRoot: 'C:\\tmp\\dl' });
+    if (!script.includes("'C:\\tmp\\dl'")) throw new Error('downloadsRoot not embedded: ' + script.slice(0, 200));
+  });
+
   console.log(`\n${pass} passed, ${fail} failed, ${skip} skipped`);
   process.exit(fail > 0 ? 1 : 0);
 })();
