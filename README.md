@@ -56,6 +56,7 @@ First launch will be slow (~10s) while npx clones + installs. Subsequent launche
 | `reply_email` | Reply / Reply All to an email |
 | `forward_email` | Forward an email |
 | `download_attachments` | Save real attachments to `~/Downloads/email-attachments/YYYY-MM-DD_<sender>_<subject>/` |
+| `force_sync` | Trigger Send/Receive and block until all sync groups finish (or timeout) |
 | `mark_as_read` | Flip read/unread state |
 | `list_calendar` | List upcoming calendar events |
 
