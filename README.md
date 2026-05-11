@@ -55,14 +55,14 @@ First launch will be slow (~10s) while npx clones + installs. Subsequent launche
 | `send_email` | Send a new mail (optionally from a specific account) |
 | `reply_email` | Reply / Reply All to an email |
 | `forward_email` | Forward an email |
-| `download_attachments` | Save real attachments to `downloads/YYYY-MM-DD_<sender>_<subject>/` folder |
+| `download_attachments` | Save real attachments to `~/Downloads/email-attachments/YYYY-MM-DD_<sender>_<subject>/` |
 | `mark_as_read` | Flip read/unread state |
 | `list_calendar` | List upcoming calendar events |
 
 ### Downloading Attachments
 
 The `download_attachments` tool extracts files from an email and saves them locally, returning the absolute folder path.
-- **Location:** Files are saved to a descriptive subfolder in the MCP server's directory: `downloads/YYYY-MM-DD_sender-slug_subject-slug/`.
+- **Location:** Files are saved under the user's Downloads folder: `~/Downloads/email-attachments/YYYY-MM-DD_sender-slug_subject-slug/`.
 - **Inline Images:** Logos and signature images are filtered out by default to avoid clutter. Set `include_inline: true` if you specifically need them.
 - **Idempotency:** Re-running the tool on the same email safely skips re-downloading if the files already exist.
 

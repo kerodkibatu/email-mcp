@@ -444,17 +444,23 @@ function Slug([string]$s, [int]$max) {
   return $t
 }
 
-$dateStr = $item.ReceivedTime.ToString('yyyy-MM-dd')
+$dateStr = ''
+try { $dateStr = $item.ReceivedTime.ToString('yyyy-MM-dd') } catch { $dateStr = '' }
+if (-not $dateStr -or $dateStr -eq '4501-01-01') { $dateStr = (Get-Date).ToString('yyyy-MM-dd') }
 
-$senderRaw = $item.SenderName
+$senderRaw = ''
+try { $senderRaw = [string]$item.SenderName } catch { $senderRaw = '' }
 if (-not $senderRaw) {
-  $addr = [string]$item.SenderEmailAddress
+  $addr = ''
+  try { $addr = [string]$item.SenderEmailAddress } catch { $addr = '' }
   if ($addr -and $addr.Contains('@')) { $senderRaw = $addr.Split('@')[0] } else { $senderRaw = $addr }
 }
 $senderSlug = Slug $senderRaw 30
 if (-not $senderSlug) { $senderSlug = 'unknown-sender' }
 
-$subjectSlug = Slug ([string]$item.Subject) 50
+$subjectRaw = ''
+try { $subjectRaw = [string]$item.Subject } catch { $subjectRaw = '' }
+$subjectSlug = Slug $subjectRaw 50
 if (-not $subjectSlug) { $subjectSlug = 'no-subject' }
 
 $folderName = "$dateStr" + "_" + "$senderSlug" + "_" + "$subjectSlug"
@@ -498,6 +504,8 @@ foreach ($att in $keep) {
   if (-not $name) { $name = 'attachment.bin' }
   # Sanitize Windows-reserved chars in filename (preserve extension)
   $name = [regex]::Replace($name, '[<>:"/\\|?*]', '_').TrimEnd(' ', '.')
+  # Reject path-traversal: any name that is only dots, or contains directory separators after sanitize
+  if (-not $name -or $name -match '^\.+$') { $name = 'attachment.bin' }
 
   $finalName = $name
   if ($usedNames.ContainsKey($finalName.ToLower())) {
@@ -510,6 +518,13 @@ foreach ($att in $keep) {
   $usedNames[$finalName.ToLower()] = $true
 
   $dest = Join-Path $folder $finalName
+  # Defense-in-depth: ensure the resolved path stays inside $folder
+  $folderFull = [System.IO.Path]::GetFullPath($folder)
+  $destFull   = [System.IO.Path]::GetFullPath($dest)
+  if (-not $destFull.StartsWith($folderFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    [void]$saved.Add([PSCustomObject]@{ filename = $finalName; size = 0; error = 'path traversal blocked' })
+    continue
+  }
   try {
     $att.SaveAsFile($dest)
     $size = (Get-Item -LiteralPath $dest).Length
@@ -624,7 +639,7 @@ EXAMPLE filter:
   },
   {
     name: 'download_attachments',
-    description: 'Save real (non-inline) attachments from an email to a descriptive subfolder under projects/email-mcp/downloads/. Returns the folder path and the list of saved files. Inline images (signatures, embedded screenshots) are filtered out by default — set include_inline=true to save them too.',
+    description: 'Save real (non-inline) attachments from an email to a descriptive subfolder under the user\'s Downloads folder (~/Downloads/email-attachments/YYYY-MM-DD_sender_subject/). Returns the folder path and the list of saved files. Inline images (signatures, embedded screenshots) are filtered out by default — set include_inline=true to save them too.',
     inputSchema: {
       type: 'object',
       required: ['entry_id'],
@@ -810,7 +825,7 @@ Write-Output '{"status":"sent","to":"${to}"}'
       if (!args.entry_id) {
         throw new McpError(ErrorCode.InvalidParams, 'entry_id is required');
       }
-      const downloadsRoot = path.resolve(__dirname, 'downloads');
+      const downloadsRoot = path.join(os.homedir(), 'Downloads', 'email-attachments');
       const script = buildDownloadScript({
         entryId: args.entry_id,
         includeInline: !!args.include_inline,
