@@ -50,9 +50,8 @@ First launch will be slow (~10s) while npx clones + installs. Subsequent launche
 | Tool | Purpose |
 |------|---------|
 | `list_accounts` | List configured Outlook accounts |
-| `list_emails` | List recent mail from a folder (Inbox/Sent/Drafts/Deleted/Outbox/Junk) |
+| `query_emails` | Query mail with a MongoDB-style filter DSL (replaces list/search) |
 | `read_email` | Read full body of an email by EntryID |
-| `search_emails` | Search subject/sender/body across folders |
 | `send_email` | Send a new mail (optionally from a specific account) |
 | `reply_email` | Reply / Reply All to an email |
 | `mark_as_read` | Flip read/unread state |
