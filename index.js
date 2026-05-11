@@ -376,6 +376,172 @@ $output | ConvertTo-Json -Depth 4 -Compress
 `;
 }
 
+// ---------- download_attachments: PS script builder ----------
+
+function buildDownloadScript({ entryId, includeInline, downloadsRoot }) {
+  const safeEntryId = String(entryId).replace(/'/g, "''");
+  const safeRoot = String(downloadsRoot).replace(/'/g, "''");
+  const incl = includeInline ? '$true' : '$false';
+  return `
+${INIT}
+$entryId = '${safeEntryId}'
+$downloadsRoot = '${safeRoot}'
+$includeInline = ${incl}
+
+try {
+  $item = $ns.GetItemFromID($entryId)
+} catch {
+  Write-Output '{"error":"Email not found"}'; exit 0
+}
+if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
+
+# --- 1. Decide which attachments are inline ---
+$htmlBody = ''
+try { $htmlBody = [string]$item.HTMLBody } catch { $htmlBody = '' }
+$pa = $null
+$keep = New-Object System.Collections.ArrayList
+$skippedInline = 0
+
+foreach ($att in $item.Attachments) {
+  $cid = ''
+  try {
+    $pa = $att.PropertyAccessor
+    $cid = [string]$pa.GetProperty('http://schemas.microsoft.com/mapi/proptag/0x3712001F')
+  } catch { $cid = '' }
+  $isInline = $false
+  if ($cid -and -not [string]::IsNullOrWhiteSpace($cid)) {
+    if ($htmlBody -and ($htmlBody.ToLower().Contains('cid:' + $cid.ToLower()))) {
+      $isInline = $true
+    } elseif (-not $htmlBody) {
+      # plaintext-only: best effort — treat any CID-bearing attachment as inline
+      $isInline = $true
+    }
+  }
+  if ($isInline -and -not $includeInline) { $skippedInline++; continue }
+  [void]$keep.Add($att)
+}
+
+if ($keep.Count -eq 0) {
+  $payload = [PSCustomObject]@{
+    folder = $null
+    saved = @()
+    skipped_inline = $skippedInline
+  }
+  if ($skippedInline -gt 0) {
+    $payload | Add-Member -NotePropertyName note -NotePropertyValue 'No real attachments — only inline images. Pass include_inline=true to save them.'
+  }
+  $payload | ConvertTo-Json -Depth 3 -Compress
+  exit 0
+}
+
+# --- 2. Build subfolder name: YYYY-MM-DD_<sender-slug>_<subject-slug> ---
+function Slug([string]$s, [int]$max) {
+  if (-not $s) { return '' }
+  $t = $s.ToLower()
+  $t = [regex]::Replace($t, '[^a-z0-9]+', '-')
+  $t = $t.Trim('-')
+  if ($t.Length -gt $max) { $t = $t.Substring(0, $max).Trim('-') }
+  return $t
+}
+
+$dateStr = ''
+try { $dateStr = $item.ReceivedTime.ToString('yyyy-MM-dd') } catch { $dateStr = '' }
+if (-not $dateStr -or $dateStr -eq '4501-01-01') { $dateStr = (Get-Date).ToString('yyyy-MM-dd') }
+
+$senderRaw = ''
+try { $senderRaw = [string]$item.SenderName } catch { $senderRaw = '' }
+if (-not $senderRaw) {
+  $addr = ''
+  try { $addr = [string]$item.SenderEmailAddress } catch { $addr = '' }
+  if ($addr -and $addr.Contains('@')) { $senderRaw = $addr.Split('@')[0] } else { $senderRaw = $addr }
+}
+$senderSlug = Slug $senderRaw 30
+if (-not $senderSlug) { $senderSlug = 'unknown-sender' }
+
+$subjectRaw = ''
+try { $subjectRaw = [string]$item.Subject } catch { $subjectRaw = '' }
+$subjectSlug = Slug $subjectRaw 50
+if (-not $subjectSlug) { $subjectSlug = 'no-subject' }
+
+$folderName = "$dateStr" + "_" + "$senderSlug" + "_" + "$subjectSlug"
+# Strip Windows-reserved chars and trailing dots/spaces (defensive — slugger should have)
+$folderName = [regex]::Replace($folderName, '[<>:"/\\|?*]', '_')
+$folderName = $folderName.TrimEnd(' ', '.')
+
+$folder = Join-Path $downloadsRoot $folderName
+
+# --- 3. Folder reuse / collision handling via .entry_id marker ---
+$markerFile = Join-Path $folder '.entry_id'
+if (Test-Path $folder) {
+  if (Test-Path $markerFile) {
+    $existing = (Get-Content $markerFile -Raw).Trim()
+    if ($existing -ne $entryId) {
+      # Different email slugs to same name — disambiguate
+      $hash = [System.BitConverter]::ToString(
+        (New-Object System.Security.Cryptography.SHA1Managed).ComputeHash(
+          [System.Text.Encoding]::UTF8.GetBytes($entryId)
+        )
+      ).Replace('-', '').ToLower().Substring(0, 8)
+      $folderName = $folderName + '_' + $hash
+      $folder = Join-Path $downloadsRoot $folderName
+      $markerFile = Join-Path $folder '.entry_id'
+    }
+  } else {
+    # Folder exists but no marker — write one now (claims it for this entry_id)
+  }
+}
+[void](New-Item -ItemType Directory -Force -Path $folder)
+if (-not (Test-Path $markerFile)) {
+  Set-Content -Path $markerFile -Value $entryId -Encoding UTF8 -NoNewline
+}
+
+# --- 4. Save each kept attachment, handling filename collisions ---
+$saved = New-Object System.Collections.ArrayList
+$usedNames = @{}
+
+foreach ($att in $keep) {
+  $name = [string]$att.FileName
+  if (-not $name) { $name = 'attachment.bin' }
+  # Sanitize Windows-reserved chars in filename (preserve extension)
+  $name = [regex]::Replace($name, '[<>:"/\\|?*]', '_').TrimEnd(' ', '.')
+  # Reject path-traversal: any name that is only dots, or contains directory separators after sanitize
+  if (-not $name -or $name -match '^\.+$') { $name = 'attachment.bin' }
+
+  $finalName = $name
+  if ($usedNames.ContainsKey($finalName.ToLower())) {
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($name)
+    $ext  = [System.IO.Path]::GetExtension($name)
+    $i = 2
+    while ($usedNames.ContainsKey(($base + ' (' + $i + ')' + $ext).ToLower())) { $i++ }
+    $finalName = $base + ' (' + $i + ')' + $ext
+  }
+  $usedNames[$finalName.ToLower()] = $true
+
+  $dest = Join-Path $folder $finalName
+  # Defense-in-depth: ensure the resolved path stays inside $folder
+  $folderFull = [System.IO.Path]::GetFullPath($folder)
+  $destFull   = [System.IO.Path]::GetFullPath($dest)
+  if (-not $destFull.StartsWith($folderFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+    [void]$saved.Add([PSCustomObject]@{ filename = $finalName; size = 0; error = 'path traversal blocked' })
+    continue
+  }
+  try {
+    $att.SaveAsFile($dest)
+    $size = (Get-Item -LiteralPath $dest).Length
+    [void]$saved.Add([PSCustomObject]@{ filename = $finalName; size = $size })
+  } catch {
+    [void]$saved.Add([PSCustomObject]@{ filename = $finalName; size = 0; error = $_.Exception.Message })
+  }
+}
+
+[PSCustomObject]@{
+  folder = $folder
+  saved = @($saved)
+  skipped_inline = $skippedInline
+} | ConvertTo-Json -Depth 4 -Compress
+`;
+}
+
 // ---------- TOOLS ----------
 
 const TOOLS = [
@@ -468,6 +634,18 @@ EXAMPLE filter:
         to: { type: 'string', description: 'Recipient email address (comma-separated for multiple)' },
         cc: { type: 'string', description: 'CC recipients (comma-separated, optional)' },
         body: { type: 'string', description: 'Optional message to prepend above the forwarded content' },
+      },
+    },
+  },
+  {
+    name: 'download_attachments',
+    description: 'Save real (non-inline) attachments from an email to a descriptive subfolder under the user\'s Downloads folder (~/Downloads/email-attachments/YYYY-MM-DD_sender_subject/). Returns the folder path and the list of saved files. Inline images (signatures, embedded screenshots) are filtered out by default — set include_inline=true to save them too.',
+    inputSchema: {
+      type: 'object',
+      required: ['entry_id'],
+      properties: {
+        entry_id: { type: 'string', description: 'EntryID of the email (from query_emails or read_email)' },
+        include_inline: { type: 'boolean', description: 'Also save embedded inline images (default: false)' },
       },
     },
   },
@@ -643,6 +821,19 @@ Write-Output '{"status":"sent","to":"${to}"}'
 `);
     }
 
+    case 'download_attachments': {
+      if (!args.entry_id) {
+        throw new McpError(ErrorCode.InvalidParams, 'entry_id is required');
+      }
+      const downloadsRoot = path.join(os.homedir(), 'Downloads', 'email-attachments');
+      const script = buildDownloadScript({
+        entryId: args.entry_id,
+        includeInline: !!args.include_inline,
+        downloadsRoot,
+      });
+      return await ps(script);
+    }
+
     case 'mark_as_read': {
       const entryId = args.entry_id.replace(/'/g, "''");
       const read = args.read !== false;
@@ -726,7 +917,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // ---------- exports for testing ----------
-module.exports = { compileFilter, buildQueryScript };
+module.exports = { compileFilter, buildQueryScript, buildDownloadScript };
 
 if (require.main === module) {
   (async () => {
