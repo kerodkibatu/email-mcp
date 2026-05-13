@@ -551,6 +551,11 @@ function buildForceSyncScript({ accountSubstring, timeoutMs }) {
 ${INIT}
 $acctFilter = '${safeAcct}'
 $timeoutMs = ${Number(timeoutMs)}
+# Outlook's SyncObject COM dispinterface events (SyncStart/SyncEnd/...) can't be
+# bound via PowerShell's Register-ObjectEvent. There is no public namespace-level
+# "is send/receive in progress" property either. So we fire each matched group
+# asynchronously, sleep for a brief grace period, and return — callers should
+# treat the result as best-effort, not a synchronous barrier.
 
 $all = @($ns.SyncObjects)
 if ($acctFilter) {
@@ -561,73 +566,37 @@ if ($acctFilter) {
 
 if ($groups.Count -eq 0) {
   if ($acctFilter -and $all.Count -gt 0) {
-    [PSCustomObject]@{ ok=$false; synced=@(); timed_out=$false; error="No SyncObject matches account filter '$acctFilter'" } | ConvertTo-Json -Compress -Depth 4
+    [PSCustomObject]@{ ok=$false; started=@(); timed_out=$false; error="No SyncObject matches account filter '$acctFilter'" } | ConvertTo-Json -Compress -Depth 4
     exit 0
   }
   try { $ns.SendAndReceive($false) } catch {}
-  [PSCustomObject]@{ ok=$true; synced=@(); timed_out=$false; note='No SyncObjects configured; fired SendAndReceive (non-blocking)' } | ConvertTo-Json -Compress -Depth 4
+  [PSCustomObject]@{ ok=$true; started=@(); timed_out=$false; note='No SyncObjects configured; fired SendAndReceive (non-blocking)' } | ConvertTo-Json -Compress -Depth 4
   exit 0
 }
 
-$subs = New-Object System.Collections.ArrayList
-$state = @{}
 $results = New-Object System.Collections.ArrayList
-$pending = $groups.Count
-
-try {
-  for ($i = 0; $i -lt $groups.Count; $i++) {
-    $so = $groups[$i]
-    $src = 'emailmcp_sync_' + $i
-    $name = ''
-    try { $name = [string]$so.Name } catch { $name = "group_$i" }
-    $state[$src] = @{ name = $name; started = (Get-Date); done = $false }
-    $sub = Register-ObjectEvent -InputObject $so -EventName SyncEnd -SourceIdentifier $src
-    [void]$subs.Add($sub)
-    try { $so.Start() } catch {
-      $state[$src].done = $true
-      [void]$results.Add([PSCustomObject]@{ name=$name; status='error'; error=$_.Exception.Message; elapsed_ms=0 })
-      $pending--
-    }
-  }
-
-  $deadline = (Get-Date).AddMilliseconds($timeoutMs)
-  while ($pending -gt 0) {
-    $remainingMs = [int]($deadline - (Get-Date)).TotalMilliseconds
-    if ($remainingMs -le 0) { break }
-    $waitSec = [Math]::Max(1, [int][Math]::Ceiling($remainingMs / 1000.0))
-    $ev = Wait-Event -Timeout $waitSec
-    if ($null -eq $ev) { break }
-    $src = $ev.SourceIdentifier
-    if ($state.ContainsKey($src) -and -not $state[$src].done) {
-      $elapsed = [int]((Get-Date) - $state[$src].started).TotalMilliseconds
-      [void]$results.Add([PSCustomObject]@{ name=$state[$src].name; status='ok'; elapsed_ms=$elapsed })
-      $state[$src].done = $true
-      $pending--
-    }
-    Remove-Event -SourceIdentifier $src -ErrorAction SilentlyContinue
-  }
-
-  $timedOut = $false
-  foreach ($src in $state.Keys) {
-    if (-not $state[$src].done) {
-      $elapsed = [int]((Get-Date) - $state[$src].started).TotalMilliseconds
-      [void]$results.Add([PSCustomObject]@{ name=$state[$src].name; status='timed_out'; elapsed_ms=$elapsed })
-      $timedOut = $true
-    }
-  }
-
-  [PSCustomObject]@{
-    ok = -not $timedOut
-    synced = @($results)
-    timed_out = $timedOut
-  } | ConvertTo-Json -Compress -Depth 4
-}
-finally {
-  foreach ($s in $subs) {
-    try { Unregister-Event -SourceIdentifier $s.Name -ErrorAction SilentlyContinue } catch {}
-    try { Remove-Job -Job $s -Force -ErrorAction SilentlyContinue } catch {}
+for ($i = 0; $i -lt $groups.Count; $i++) {
+  $so = $groups[$i]
+  $name = ''
+  try { $name = [string]$so.Name } catch { $name = "group_$i" }
+  try {
+    $so.Start()
+    [void]$results.Add([PSCustomObject]@{ name=$name; status='started' })
+  } catch {
+    [void]$results.Add([PSCustomObject]@{ name=$name; status='error'; error=$_.Exception.Message })
   }
 }
+
+# Brief grace period to let async sync make headway (capped to keep tool responsive).
+$graceMs = [Math]::Min($timeoutMs, 5000)
+if ($graceMs -gt 0) { Start-Sleep -Milliseconds $graceMs }
+
+[PSCustomObject]@{
+  ok = $true
+  started = @($results)
+  timed_out = $false
+  note = 'Send/Receive fired asynchronously. Outlook does not expose a sync barrier; tool waited ' + $graceMs + 'ms then returned.'
+} | ConvertTo-Json -Compress -Depth 4
 `;
 }
 
