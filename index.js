@@ -26,13 +26,14 @@ function textToHtml(s) {
   return escaped.replace(/\r\n|\r|\n/g, '<br>');
 }
 
-async function ps(script) {
+async function ps(script, opts) {
+  const timeout = (opts && opts.timeoutMs) || 60000;
   const tmp = path.join(os.tmpdir(), `email-mcp-${Date.now()}-${Math.random().toString(36).slice(2)}.ps1`);
   fs.writeFileSync(tmp, '﻿' + script, 'utf8');
   try {
     const { stdout, stderr } = await execAsync(
       `powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -File "${tmp}"`,
-      { timeout: 60000, maxBuffer: 32 * 1024 * 1024, encoding: 'buffer' }
+      { timeout, maxBuffer: 32 * 1024 * 1024, encoding: 'buffer' }
     );
     if (stderr && stderr.length) {
       const errText = Buffer.isBuffer(stderr) ? stderr.toString('utf8') : stderr;
@@ -542,6 +543,94 @@ foreach ($att in $keep) {
 `;
 }
 
+// ---------- force_sync: PS script builder ----------
+
+function buildForceSyncScript({ accountSubstring, timeoutMs }) {
+  const safeAcct = String(accountSubstring || '').replace(/'/g, "''");
+  return `
+${INIT}
+$acctFilter = '${safeAcct}'
+$timeoutMs = ${Number(timeoutMs)}
+
+$all = @($ns.SyncObjects)
+if ($acctFilter) {
+  $groups = @($all | Where-Object { $_.Name -like ('*' + $acctFilter + '*') })
+} else {
+  $groups = $all
+}
+
+if ($groups.Count -eq 0) {
+  if ($acctFilter -and $all.Count -gt 0) {
+    [PSCustomObject]@{ ok=$false; synced=@(); timed_out=$false; error="No SyncObject matches account filter '$acctFilter'" } | ConvertTo-Json -Compress -Depth 4
+    exit 0
+  }
+  try { $ns.SendAndReceive($false) } catch {}
+  [PSCustomObject]@{ ok=$true; synced=@(); timed_out=$false; note='No SyncObjects configured; fired SendAndReceive (non-blocking)' } | ConvertTo-Json -Compress -Depth 4
+  exit 0
+}
+
+$subs = New-Object System.Collections.ArrayList
+$state = @{}
+$results = New-Object System.Collections.ArrayList
+$pending = $groups.Count
+
+try {
+  for ($i = 0; $i -lt $groups.Count; $i++) {
+    $so = $groups[$i]
+    $src = 'emailmcp_sync_' + $i
+    $name = ''
+    try { $name = [string]$so.Name } catch { $name = "group_$i" }
+    $state[$src] = @{ name = $name; started = (Get-Date); done = $false }
+    $sub = Register-ObjectEvent -InputObject $so -EventName SyncEnd -SourceIdentifier $src
+    [void]$subs.Add($sub)
+    try { $so.Start() } catch {
+      $state[$src].done = $true
+      [void]$results.Add([PSCustomObject]@{ name=$name; status='error'; error=$_.Exception.Message; elapsed_ms=0 })
+      $pending--
+    }
+  }
+
+  $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+  while ($pending -gt 0) {
+    $remainingMs = [int]($deadline - (Get-Date)).TotalMilliseconds
+    if ($remainingMs -le 0) { break }
+    $waitSec = [Math]::Max(1, [int][Math]::Ceiling($remainingMs / 1000.0))
+    $ev = Wait-Event -Timeout $waitSec
+    if ($null -eq $ev) { break }
+    $src = $ev.SourceIdentifier
+    if ($state.ContainsKey($src) -and -not $state[$src].done) {
+      $elapsed = [int]((Get-Date) - $state[$src].started).TotalMilliseconds
+      [void]$results.Add([PSCustomObject]@{ name=$state[$src].name; status='ok'; elapsed_ms=$elapsed })
+      $state[$src].done = $true
+      $pending--
+    }
+    Remove-Event -SourceIdentifier $src -ErrorAction SilentlyContinue
+  }
+
+  $timedOut = $false
+  foreach ($src in $state.Keys) {
+    if (-not $state[$src].done) {
+      $elapsed = [int]((Get-Date) - $state[$src].started).TotalMilliseconds
+      [void]$results.Add([PSCustomObject]@{ name=$state[$src].name; status='timed_out'; elapsed_ms=$elapsed })
+      $timedOut = $true
+    }
+  }
+
+  [PSCustomObject]@{
+    ok = -not $timedOut
+    synced = @($results)
+    timed_out = $timedOut
+  } | ConvertTo-Json -Compress -Depth 4
+}
+finally {
+  foreach ($s in $subs) {
+    try { Unregister-Event -SourceIdentifier $s.Name -ErrorAction SilentlyContinue } catch {}
+    try { Remove-Job -Job $s -Force -ErrorAction SilentlyContinue } catch {}
+  }
+}
+`;
+}
+
 // ---------- TOOLS ----------
 
 const TOOLS = [
@@ -658,6 +747,17 @@ EXAMPLE filter:
       properties: {
         entry_id: { type: 'string', description: 'EntryID of the email' },
         read: { type: 'boolean', description: 'true = mark read, false = mark unread (default: true)' },
+      },
+    },
+  },
+  {
+    name: 'force_sync',
+    description: 'Trigger Outlook Send/Receive and block until all configured sync groups finish (or timeout). Useful before querying to make sure recent server-side mail is local. Returns per-group elapsed time and a timed_out flag.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        timeout_sec: { type: 'number', description: 'Max seconds to wait for sync (default: 60, max: 600)' },
+        account: { type: 'string', description: 'Substring match against SyncObject names to limit scope (optional)' },
       },
     },
   },
@@ -834,6 +934,16 @@ Write-Output '{"status":"sent","to":"${to}"}'
       return await ps(script);
     }
 
+    case 'force_sync': {
+      const rawTimeout = typeof args.timeout_sec === 'number' ? args.timeout_sec : 60;
+      const timeoutSec = Math.max(1, Math.min(600, rawTimeout));
+      const script = buildForceSyncScript({
+        accountSubstring: args.account || '',
+        timeoutMs: timeoutSec * 1000,
+      });
+      return await ps(script, { timeoutMs: (timeoutSec + 15) * 1000 });
+    }
+
     case 'mark_as_read': {
       const entryId = args.entry_id.replace(/'/g, "''");
       const read = args.read !== false;
@@ -917,7 +1027,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // ---------- exports for testing ----------
-module.exports = { compileFilter, buildQueryScript, buildDownloadScript };
+module.exports = { compileFilter, buildQueryScript, buildDownloadScript, buildForceSyncScript };
 
 if (require.main === module) {
   (async () => {
