@@ -52,13 +52,29 @@ First launch will be slow (~10s) while npx clones + installs. Subsequent launche
 | `list_accounts` | List configured Outlook accounts |
 | `query_emails` | MongoDB-style querying across all folders (`has_attachments`, `unread`, etc.) |
 | `read_email` | Read full body of an email by EntryID |
-| `send_email` | Send a new mail (optionally from a specific account) |
+| `send_email` | Send a new mail (optionally from a specific account, with file attachments) |
 | `reply_email` | Reply / Reply All to an email |
 | `forward_email` | Forward an email |
 | `download_attachments` | Save real attachments to `~/Downloads/email-attachments/YYYY-MM-DD_<sender>_<subject>/` |
 | `force_sync` | Trigger Send/Receive and block until all sync groups finish (or timeout) |
 | `mark_as_read` | Flip read/unread state |
 | `list_calendar` | List upcoming calendar events |
+
+### Sending Attachments
+
+`send_email` accepts an optional `attachments` array of absolute file paths. Each path must exist and point to a regular file; if any path is invalid, the tool returns an error and does not send. Forward and back slashes are both accepted on Windows; `~` and environment variables are **not** expanded — pass fully resolved paths.
+
+```json
+{
+  "to": "kerod@example.com",
+  "subject": "Signed contract",
+  "body": "See attached.",
+  "attachments": [
+    "C:\\Users\\Kerod\\Desktop\\contract.pdf",
+    "C:/Users/Kerod/Desktop/cover-letter.pdf"
+  ]
+}
+```
 
 ### Downloading Attachments
 
