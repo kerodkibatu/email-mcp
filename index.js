@@ -543,6 +543,90 @@ foreach ($att in $keep) {
 `;
 }
 
+// ---------- send_email: attachment validation + PS script builder ----------
+
+// Normalize a user-supplied attachment path. Accepts forward or back slashes.
+// Requires the path to be absolute (no ~ expansion, no env var expansion).
+// Returns the normalized absolute path on success, or throws McpError on
+// invalid input. Does NOT touch the filesystem — caller stat-checks separately.
+function normalizeAttachmentPath(p) {
+  if (typeof p !== 'string' || !p.trim()) {
+    throw new McpError(ErrorCode.InvalidParams, `Attachment path must be a non-empty string`);
+  }
+  const normalized = path.normalize(p.replace(/\//g, '\\'));
+  if (!path.isAbsolute(normalized)) {
+    throw new McpError(ErrorCode.InvalidParams, `Attachment path must be absolute: ${p}`);
+  }
+  return normalized;
+}
+
+// Validate that each path exists and is a regular file (not a directory).
+// Throws McpError listing every offending path. Returns the array of
+// normalized paths on success.
+function validateAttachments(paths) {
+  if (!paths) return [];
+  if (!Array.isArray(paths)) {
+    throw new McpError(ErrorCode.InvalidParams, `attachments must be an array of file paths`);
+  }
+  const normalized = paths.map(normalizeAttachmentPath);
+  const problems = [];
+  for (const p of normalized) {
+    let st;
+    try {
+      st = fs.statSync(p);
+    } catch (e) {
+      problems.push(`${p} (not found)`);
+      continue;
+    }
+    if (!st.isFile()) {
+      problems.push(`${p} (not a regular file)`);
+    }
+  }
+  if (problems.length) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Invalid attachment path(s): ${problems.join('; ')}`
+    );
+  }
+  return normalized;
+}
+
+function buildSendScript({ to, subjectB64, htmlBodyB64, cc, account, attachments }) {
+  const safeTo = String(to).replace(/'/g, "''");
+  const safeCc = String(cc || '').replace(/'/g, "''");
+  const safeAcct = String(account || '').replace(/'/g, "''");
+  const safeAttachments = (attachments || []).map(p => String(p).replace(/'/g, "''"));
+  const attachLines = safeAttachments
+    .map(p => `$mail.Attachments.Add('${p}') | Out-Null`)
+    .join('\n');
+
+  return `
+${INIT}
+$mail = $ol.CreateItem(0)
+$mail.Subject = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${subjectB64}'))
+$mail.HTMLBody = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${htmlBodyB64}'))
+$mail.To = '${safeTo}'
+${safeCc ? `$mail.CC = '${safeCc}'` : ''}
+${attachLines}
+${safeAcct ? `
+$accts = $ol.Session.Accounts
+$matched = $null
+foreach ($acct in $accts) {
+  if ($acct.SmtpAddress -like '*${safeAcct}*') { $matched = $acct; break }
+}
+if (-not $matched) {
+  Write-Output ('{"error":"Account not found: ${safeAcct}"}')
+  exit 0
+}
+# Direct property assignment is silently ignored by Outlook COM; must use reflection.
+[System.Type]$t = $mail.GetType()
+[void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $mail, @($matched))
+$sentFrom = $mail.SendUsingAccount.SmtpAddress` : '$sentFrom = $ol.Session.CurrentUser.Address'}
+$mail.Send()
+Write-Output ('{"status":"sent","to":"${safeTo}","from":"' + $sentFrom + '"}')
+`;
+}
+
 // ---------- force_sync: PS script builder ----------
 
 function buildForceSyncScript({ accountSubstring, timeoutMs }) {
@@ -665,6 +749,11 @@ EXAMPLE filter:
         subject: { type: 'string', description: 'Email subject' },
         body: { type: 'string', description: 'Email body (plain text)' },
         account: { type: 'string', description: 'Send from this account email address (optional, uses default)' },
+        attachments: {
+          type: 'array',
+          items: { type: 'string', description: 'Absolute path to a file to attach.' },
+          description: 'Optional list of absolute file paths to attach. Forward or back slashes are accepted on Windows. No ~ or env-var expansion — pass fully resolved paths.',
+        },
       },
     },
   },
@@ -821,36 +910,21 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
     }
 
     case 'send_email': {
-      const to = args.to.replace(/'/g, "''");
       const subjectB64 = Buffer.from(args.subject, 'utf8').toString('base64');
       const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body)}</div>`, 'utf8').toString('base64');
-      const cc = (args.cc || '').replace(/'/g, "''");
-      const account = (args.account || '').replace(/'/g, "''");
+      // Validate attachments BEFORE building/running the PS script — invalid
+      // paths must abort the send, not produce a half-attached mail.
+      const attachments = validateAttachments(args.attachments);
 
-      return await ps(`
-${INIT}
-$mail = $ol.CreateItem(0)
-$mail.Subject = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${subjectB64}'))
-$mail.HTMLBody = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${htmlBodyB64}'))
-$mail.To = '${to}'
-${cc ? `$mail.CC = '${cc}'` : ''}
-${account ? `
-$accts = $ol.Session.Accounts
-$matched = $null
-foreach ($acct in $accts) {
-  if ($acct.SmtpAddress -like '*${account}*') { $matched = $acct; break }
-}
-if (-not $matched) {
-  Write-Output ('{"error":"Account not found: ${account}"}')
-  exit 0
-}
-# Direct property assignment is silently ignored by Outlook COM; must use reflection.
-[System.Type]$t = $mail.GetType()
-[void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $mail, @($matched))
-$sentFrom = $mail.SendUsingAccount.SmtpAddress` : '$sentFrom = $ol.Session.CurrentUser.Address'}
-$mail.Send()
-Write-Output ('{"status":"sent","to":"${to}","from":"' + $sentFrom + '"}')
-`);
+      const script = buildSendScript({
+        to: args.to,
+        subjectB64,
+        htmlBodyB64,
+        cc: args.cc || '',
+        account: args.account || '',
+        attachments,
+      });
+      return await ps(script);
     }
 
     case 'reply_email': {
@@ -996,7 +1070,16 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 // ---------- exports for testing ----------
-module.exports = { compileFilter, buildQueryScript, buildDownloadScript, buildForceSyncScript };
+module.exports = {
+  compileFilter,
+  buildQueryScript,
+  buildDownloadScript,
+  buildForceSyncScript,
+  buildSendScript,
+  normalizeAttachmentPath,
+  validateAttachments,
+  TOOLS,
+};
 
 if (require.main === module) {
   (async () => {
