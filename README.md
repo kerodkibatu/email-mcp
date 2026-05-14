@@ -60,6 +60,21 @@ First launch will be slow (~10s) while npx clones + installs. Subsequent launche
 | `mark_as_read` | Flip read/unread state |
 | `list_calendar` | List upcoming calendar events |
 
+### Choosing the Sending Account
+
+`send_email`, `reply_email`, and `forward_email` **require** an `account` parameter — a substring of the configured Outlook account name (typically the SMTP address). This is intentional: with multiple accounts configured (e.g. personal + work), defaulting to Outlook's primary account is a footgun — it's how personal mail leaks out of a work account or vice versa. Forcing the caller to name the account makes the send explicit.
+
+If the supplied `account` doesn't match any configured account (case-insensitive substring), the tool errors and lists the available accounts. Run `list_accounts` first if you don't already know the name.
+
+```json
+{
+  "to": "client@example.com",
+  "subject": "Status update",
+  "body": "Heads up — ...",
+  "account": "kerod@towlydigital.com"
+}
+```
+
 ### Sending Attachments
 
 `send_email` accepts an optional `attachments` array of absolute file paths. Each path must exist and point to a regular file; if any path is invalid, the tool returns an error and does not send. Forward and back slashes are both accepted on Windows; `~` and environment variables are **not** expanded — pass fully resolved paths.
@@ -69,6 +84,7 @@ First launch will be slow (~10s) while npx clones + installs. Subsequent launche
   "to": "kerod@example.com",
   "subject": "Signed contract",
   "body": "See attached.",
+  "account": "kerod@towlydigital.com",
   "attachments": [
     "C:\\Users\\Kerod\\Desktop\\contract.pdf",
     "C:/Users/Kerod/Desktop/cover-letter.pdf"

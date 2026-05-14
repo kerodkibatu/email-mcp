@@ -37,6 +37,21 @@ t('send_email tool advertises optional attachments array of strings', () => {
   assert.ok(!required.includes('attachments'), 'attachments must not be required');
 });
 
+// Regression: PR #4 added attachments support. Lock in that buildSendScript
+// emits the Attachments.Add line so we never silently lose this wiring again.
+t('buildSendScript regression: Attachments.Add is wired for non-empty list', () => {
+  const s = buildSendScript({
+    to: 'a@b.com',
+    subjectB64: Buffer.from('hi', 'utf8').toString('base64'),
+    htmlBodyB64: Buffer.from('<div>hi</div>', 'utf8').toString('base64'),
+    cc: '',
+    account: 'kerod@example.com',
+    attachments: ['C:\\file.pdf'],
+  });
+  assert.ok(/\$mail\.Attachments\.Add\('C:\\file\.pdf'\)/.test(s),
+    'expected $mail.Attachments.Add(\'C:\\\\file.pdf\') in script. Got:\n' + s);
+});
+
 // --- normalizeAttachmentPath ---
 
 t('normalizeAttachmentPath rejects empty / non-string', () => {

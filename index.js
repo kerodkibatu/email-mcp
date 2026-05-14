@@ -543,6 +543,56 @@ foreach ($att in $keep) {
 `;
 }
 
+// ---------- account selection validation ----------
+
+// Given the user-supplied account string and the list of configured Outlook
+// accounts (as returned by list_accounts — `[{ name, entry_id }]`), confirm
+// the supplied account matches at least one configured account via
+// case-insensitive substring match against `name`. Throws McpError with a
+// helpful message (listing available accounts) on no match.
+//
+// Pure function — no I/O. Caller is responsible for fetching the account
+// list. This makes the validator testable offline against a mocked list.
+function validateAccountSelection(supplied, accounts) {
+  if (typeof supplied !== 'string' || !supplied.trim()) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `account is required. Available accounts: ${accounts.map(a => a.name).join(', ') || '(none configured)'}`
+    );
+  }
+  const needle = supplied.toLowerCase();
+  const match = accounts.find(a => String(a.name || '').toLowerCase().includes(needle));
+  if (!match) {
+    throw new McpError(
+      ErrorCode.InvalidParams,
+      `Unknown account: '${supplied}'. Available accounts: ${accounts.map(a => a.name).join(', ') || '(none configured)'}`
+    );
+  }
+  return match;
+}
+
+// Fetches configured Outlook accounts via PowerShell. Returns `[{ name, entry_id }]`.
+async function fetchOutlookAccounts() {
+  const out = await ps(`
+${INIT}
+$accounts = @()
+foreach ($store in $ns.Folders) {
+  $accounts += [PSCustomObject]@{
+    name = $store.Name
+    entry_id = $store.EntryID
+  }
+}
+$accounts | ConvertTo-Json -Depth 2 -Compress
+`);
+  if (!out) return [];
+  try {
+    const parsed = JSON.parse(out);
+    return Array.isArray(parsed) ? parsed : [parsed];
+  } catch {
+    return [];
+  }
+}
+
 // ---------- send_email: attachment validation + PS script builder ----------
 
 // Normalize a user-supplied attachment path. Accepts forward or back slashes.
@@ -739,16 +789,16 @@ EXAMPLE filter:
   },
   {
     name: 'send_email',
-    description: 'Send a new email',
+    description: 'Send a new email. The `account` parameter is REQUIRED — pass a substring of the account name (e.g. SMTP address) to disambiguate. This prevents accidentally sending personal mail from a work account (or vice versa) when multiple accounts are configured in Outlook.',
     inputSchema: {
       type: 'object',
-      required: ['to', 'subject', 'body'],
+      required: ['to', 'subject', 'body', 'account'],
       properties: {
         to: { type: 'string', description: 'Recipient email address (comma-separated for multiple)' },
         cc: { type: 'string', description: 'CC recipients (comma-separated, optional)' },
         subject: { type: 'string', description: 'Email subject' },
         body: { type: 'string', description: 'Email body (plain text)' },
-        account: { type: 'string', description: 'Send from this account email address (optional, uses default)' },
+        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime — error lists available accounts if no match.' },
         attachments: {
           type: 'array',
           items: { type: 'string', description: 'Absolute path to a file to attach.' },
@@ -759,28 +809,30 @@ EXAMPLE filter:
   },
   {
     name: 'reply_email',
-    description: 'Reply to an email',
+    description: 'Reply to an email. The `account` parameter is REQUIRED to prevent accidental cross-account replies.',
     inputSchema: {
       type: 'object',
-      required: ['entry_id', 'body'],
+      required: ['entry_id', 'body', 'account'],
       properties: {
         entry_id: { type: 'string', description: 'EntryID of the email to reply to' },
         body: { type: 'string', description: 'Reply body text' },
         reply_all: { type: 'boolean', description: 'Reply to all recipients (default: false)' },
+        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime.' },
       },
     },
   },
   {
     name: 'forward_email',
-    description: 'Forward an email. Preserves the original subject (FW:), quoted body, and attachments.',
+    description: 'Forward an email. Preserves the original subject (FW:), quoted body, and attachments. The `account` parameter is REQUIRED to prevent accidental cross-account forwards.',
     inputSchema: {
       type: 'object',
-      required: ['entry_id', 'to'],
+      required: ['entry_id', 'to', 'account'],
       properties: {
         entry_id: { type: 'string', description: 'EntryID of the email to forward' },
         to: { type: 'string', description: 'Recipient email address (comma-separated for multiple)' },
         cc: { type: 'string', description: 'CC recipients (comma-separated, optional)' },
         body: { type: 'string', description: 'Optional message to prepend above the forwarded content' },
+        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime.' },
       },
     },
   },
@@ -910,6 +962,12 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
     }
 
     case 'send_email': {
+      // Validate account is supplied and matches a configured Outlook account.
+      // Done BEFORE building the PS script so we fail fast with a helpful
+      // message instead of relying on the in-script "Account not found" branch.
+      const accounts = await fetchOutlookAccounts();
+      validateAccountSelection(args.account, accounts);
+
       const subjectB64 = Buffer.from(args.subject, 'utf8').toString('base64');
       const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body)}</div>`, 'utf8').toString('base64');
       // Validate attachments BEFORE building/running the PS script — invalid
@@ -921,14 +979,18 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
         subjectB64,
         htmlBodyB64,
         cc: args.cc || '',
-        account: args.account || '',
+        account: args.account,
         attachments,
       });
       return await ps(script);
     }
 
     case 'reply_email': {
+      const accounts = await fetchOutlookAccounts();
+      validateAccountSelection(args.account, accounts);
+
       const entryId = args.entry_id.replace(/'/g, "''");
+      const safeAcct = String(args.account).replace(/'/g, "''");
       const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body)}</div>`, 'utf8').toString('base64');
       const replyAll = args.reply_all ? 'true' : 'false';
 
@@ -939,15 +1001,30 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
 $reply = if ($${replyAll}) { $item.ReplyAll() } else { $item.Reply() }
 $html = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${htmlBodyB64}'))
 $reply.HTMLBody = $html + $reply.HTMLBody
+$accts = $ol.Session.Accounts
+$matched = $null
+foreach ($acct in $accts) {
+  if ($acct.SmtpAddress -like '*${safeAcct}*') { $matched = $acct; break }
+}
+if (-not $matched) {
+  Write-Output ('{"error":"Account not found: ${safeAcct}"}')
+  exit 0
+}
+[System.Type]$t = $reply.GetType()
+[void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $reply, @($matched))
 $reply.Send()
-Write-Output '{"status":"sent"}'
+Write-Output ('{"status":"sent","from":"' + $matched.SmtpAddress + '"}')
 `);
     }
 
     case 'forward_email': {
+      const accounts = await fetchOutlookAccounts();
+      validateAccountSelection(args.account, accounts);
+
       const entryId = args.entry_id.replace(/'/g, "''");
       const to = args.to.replace(/'/g, "''");
       const cc = (args.cc || '').replace(/'/g, "''");
+      const safeAcct = String(args.account).replace(/'/g, "''");
       const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body || '')}</div>`, 'utf8').toString('base64');
 
       return await ps(`
@@ -959,8 +1036,19 @@ $fwd.To = '${to}'
 ${cc ? `$fwd.CC = '${cc}'` : ''}
 ${args.body ? `$html = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${htmlBodyB64}'))
 $fwd.HTMLBody = $html + $fwd.HTMLBody` : ''}
+$accts = $ol.Session.Accounts
+$matched = $null
+foreach ($acct in $accts) {
+  if ($acct.SmtpAddress -like '*${safeAcct}*') { $matched = $acct; break }
+}
+if (-not $matched) {
+  Write-Output ('{"error":"Account not found: ${safeAcct}"}')
+  exit 0
+}
+[System.Type]$t = $fwd.GetType()
+[void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $fwd, @($matched))
 $fwd.Send()
-Write-Output '{"status":"sent","to":"${to}"}'
+Write-Output ('{"status":"sent","to":"${to}","from":"' + $matched.SmtpAddress + '"}')
 `);
     }
 
@@ -1078,6 +1166,8 @@ module.exports = {
   buildSendScript,
   normalizeAttachmentPath,
   validateAttachments,
+  validateAccountSelection,
+  fetchOutlookAccounts,
   TOOLS,
 };
 
