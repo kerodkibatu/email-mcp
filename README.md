@@ -75,6 +75,30 @@ If the supplied `account` doesn't match any configured account (case-insensitive
 }
 ```
 
+### Send As (Exchange "Send As" permission required)
+
+`send_email`, `reply_email`, and `forward_email` accept an optional `send_as` parameter — an SMTP address to send AS. The recipient sees that address as the From, with **no** "on behalf of" disclosure. This is the true Exchange Send As, distinct from Send on Behalf.
+
+Mechanically, the MCP sets `SendUsingAccount` to the `account` you provide (the transport mailbox) and then overwrites both the `PR_SENT_REPRESENTING_*` and `PR_SENDER_*` MAPI properties to point at `send_as`. Exchange validates the permission at submit time.
+
+Requirements:
+- The `account` user must have **Send As** permission on the `send_as` mailbox, granted server-side by an Exchange admin. The MCP cannot grant or check this — it can only attempt the send.
+- The `send_as` address must be resolvable by Exchange — typically a mailbox in the same tenant. External addresses (gmail.com, etc.) will fail at resolution with an error.
+- If the permission is missing, behavior depends on tenant policy: Exchange may bounce the message, silently downgrade it to "on behalf of", or leave it in the Outbox.
+- This feature only works inside an Exchange organization that has explicitly authorized it. It cannot be used to spoof external senders.
+
+```json
+{
+  "to": "client@example.com",
+  "subject": "Status update",
+  "body": "Heads up — ...",
+  "account": "admin@custom.com",
+  "send_as": "contact@custom.com"
+}
+```
+
+The response includes a `sent_as` field echoing the address when `send_as` was used.
+
 ### Sending Attachments
 
 `send_email` accepts an optional `attachments` array of absolute file paths. Each path must exist and point to a regular file; if any path is invalid, the tool returns an error and does not send. Forward and back slashes are both accepted on Windows; `~` and environment variables are **not** expanded — pass fully resolved paths.

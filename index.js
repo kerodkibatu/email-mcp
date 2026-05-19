@@ -641,7 +641,54 @@ function validateAttachments(paths) {
   return normalized;
 }
 
-function buildSendScript({ to, subjectB64, htmlBodyB64, cc, account, attachments }) {
+// Emits the PowerShell that rewrites sender MAPI props on `itemVar` so the mail
+// is sent AS `sendAs` (no "on behalf of"). Must be injected AFTER SendUsingAccount
+// is set and BEFORE .Send() is called.
+//
+// Both PR_SENT_REPRESENTING_* and PR_SENDER_* are overwritten — setting only the
+// representing props produces "admin on behalf of contact"; overwriting sender
+// too is what collapses it to a pure Send As. Exchange validates the permission
+// at submit time; without "Send As" perm the message will bounce, get rewritten
+// back to "on behalf of", or sit in the Outbox depending on tenant policy.
+//
+// Returns '' when sendAs is empty so the caller can unconditionally interpolate.
+function buildSendAsBlock(itemVar, sendAs) {
+  if (!sendAs) return '';
+  const safe = String(sendAs).replace(/'/g, "''");
+  return `
+$sendAs = '${safe}'
+$rcp = $ol.Session.CreateRecipient($sendAs)
+$null = $rcp.Resolve()
+if (-not $rcp.Resolved) {
+  Write-Output ('{"error":"send_as address could not be resolved by Exchange: ${safe}. The address must be a recipient Exchange knows about (typically same tenant)."}')
+  exit 0
+}
+$ae           = $rcp.AddressEntry
+$rcpAddrType  = [string]$ae.Type
+$rcpAddr      = [string]$ae.Address
+$rcpName      = [string]$ae.Name
+$rcpPA        = $rcp.PropertyAccessor
+$rcpEntryId   = $rcpPA.GetProperty('http://schemas.microsoft.com/mapi/proptag/0x0FFF0102')
+$rcpSearchKey = $rcpPA.GetProperty('http://schemas.microsoft.com/mapi/proptag/0x300B0102')
+$pa = ${itemVar}.PropertyAccessor
+# PR_SENT_REPRESENTING_{NAME, EMAIL_ADDRESS, ADDRTYPE, ENTRYID, SEARCH_KEY}
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0042001F', $rcpName)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0065001F', $rcpAddr)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0064001F', $rcpAddrType)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x00410102', $rcpEntryId)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x003B0102', $rcpSearchKey)
+# PR_SENDER_{NAME, EMAIL_ADDRESS, ADDRTYPE, ENTRYID, SEARCH_KEY} — overwriting these
+# is what suppresses "on behalf of" and makes it a true Send As.
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0C1A001F', $rcpName)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0C1F001F', $rcpAddr)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0C1E001F', $rcpAddrType)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0C190102', $rcpEntryId)
+$pa.SetProperty('http://schemas.microsoft.com/mapi/proptag/0x0C1D0102', $rcpSearchKey)
+${itemVar}.Save()
+`;
+}
+
+function buildSendScript({ to, subjectB64, htmlBodyB64, cc, account, attachments, sendAs }) {
   const safeTo = String(to).replace(/'/g, "''");
   const safeCc = String(cc || '').replace(/'/g, "''");
   const safeAcct = String(account || '').replace(/'/g, "''");
@@ -649,6 +696,8 @@ function buildSendScript({ to, subjectB64, htmlBodyB64, cc, account, attachments
   const attachLines = safeAttachments
     .map(p => `$mail.Attachments.Add('${p}') | Out-Null`)
     .join('\n');
+  const sendAsBlock = buildSendAsBlock('$mail', sendAs);
+  const safeSendAs = String(sendAs || '').replace(/'/g, "''");
 
   return `
 ${INIT}
@@ -672,8 +721,9 @@ if (-not $matched) {
 [System.Type]$t = $mail.GetType()
 [void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $mail, @($matched))
 $sentFrom = $mail.SendUsingAccount.SmtpAddress` : '$sentFrom = $ol.Session.CurrentUser.Address'}
+${sendAsBlock}
 $mail.Send()
-Write-Output ('{"status":"sent","to":"${safeTo}","from":"' + $sentFrom + '"}')
+Write-Output ('{"status":"sent","to":"${safeTo}","from":"' + $sentFrom + '"${safeSendAs ? `,"sent_as":"${safeSendAs}"` : ''}}')
 `;
 }
 
@@ -789,7 +839,7 @@ EXAMPLE filter:
   },
   {
     name: 'send_email',
-    description: 'Send a new email. The `account` parameter is REQUIRED — pass a substring of the account name (e.g. SMTP address) to disambiguate. This prevents accidentally sending personal mail from a work account (or vice versa) when multiple accounts are configured in Outlook.',
+    description: 'Send a new email. The `account` parameter is REQUIRED — pass a substring of the account name (e.g. SMTP address) to disambiguate. This prevents accidentally sending personal mail from a work account (or vice versa) when multiple accounts are configured in Outlook. Use the optional `send_as` parameter to send AS a different mailbox (true Send As — recipient sees the target address as the sender, no "on behalf of"). Requires Exchange "Send As" permission granted server-side on the target mailbox.',
     inputSchema: {
       type: 'object',
       required: ['to', 'subject', 'body', 'account'],
@@ -798,7 +848,8 @@ EXAMPLE filter:
         cc: { type: 'string', description: 'CC recipients (comma-separated, optional)' },
         subject: { type: 'string', description: 'Email subject' },
         body: { type: 'string', description: 'Email body (plain text)' },
-        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime — error lists available accounts if no match.' },
+        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime — error lists available accounts if no match. This is the TRANSPORT account (the mailbox actually submitting the message). When `send_as` is also set, this account must have Exchange "Send As" permission on the target mailbox.' },
+        send_as: { type: 'string', description: 'Optional. SMTP address of a mailbox to send AS. The recipient sees this address as the From with NO "on behalf of" suffix. Works by rewriting MAPI sender properties via PropertyAccessor. Constraints: (1) the `account` user must have Exchange "Send As" permission on this mailbox — granted by an Exchange admin; the MCP cannot grant or verify it. (2) The address must be resolvable by Exchange (typically same tenant); external addresses like gmail.com will fail at resolution. (3) If the permission is missing, Exchange may bounce the send, silently downgrade to "on behalf of", or leave the message in the Outbox — behavior depends on tenant policy. (4) Do NOT use this to spoof external senders; it only works inside an Exchange organization that explicitly authorized it.' },
         attachments: {
           type: 'array',
           items: { type: 'string', description: 'Absolute path to a file to attach.' },
@@ -809,7 +860,7 @@ EXAMPLE filter:
   },
   {
     name: 'reply_email',
-    description: 'Reply to an email. The `account` parameter is REQUIRED to prevent accidental cross-account replies.',
+    description: 'Reply to an email. The `account` parameter is REQUIRED to prevent accidental cross-account replies. Use the optional `send_as` parameter for true Send As (see send_email for the full constraints).',
     inputSchema: {
       type: 'object',
       required: ['entry_id', 'body', 'account'],
@@ -817,13 +868,14 @@ EXAMPLE filter:
         entry_id: { type: 'string', description: 'EntryID of the email to reply to' },
         body: { type: 'string', description: 'Reply body text' },
         reply_all: { type: 'boolean', description: 'Reply to all recipients (default: false)' },
-        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime.' },
+        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime. This is the TRANSPORT account; when `send_as` is set it must have Exchange "Send As" permission on the target mailbox.' },
+        send_as: { type: 'string', description: 'Optional. SMTP address of a mailbox to send AS — true Send As, no "on behalf of". Requires Exchange "Send As" permission on the target mailbox, granted server-side by an admin. Address must be resolvable by Exchange (typically same tenant). Without the permission, the send may bounce, downgrade to "on behalf of", or sit in the Outbox depending on tenant policy. Cannot be used to spoof external senders.' },
       },
     },
   },
   {
     name: 'forward_email',
-    description: 'Forward an email. Preserves the original subject (FW:), quoted body, and attachments. The `account` parameter is REQUIRED to prevent accidental cross-account forwards.',
+    description: 'Forward an email. Preserves the original subject (FW:), quoted body, and attachments. The `account` parameter is REQUIRED to prevent accidental cross-account forwards. Use the optional `send_as` parameter for true Send As (see send_email for the full constraints).',
     inputSchema: {
       type: 'object',
       required: ['entry_id', 'to', 'account'],
@@ -832,7 +884,8 @@ EXAMPLE filter:
         to: { type: 'string', description: 'Recipient email address (comma-separated for multiple)' },
         cc: { type: 'string', description: 'CC recipients (comma-separated, optional)' },
         body: { type: 'string', description: 'Optional message to prepend above the forwarded content' },
-        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime.' },
+        account: { type: 'string', description: 'REQUIRED. Substring of the sending account name (typically the SMTP address). Validated against configured accounts at runtime. This is the TRANSPORT account; when `send_as` is set it must have Exchange "Send As" permission on the target mailbox.' },
+        send_as: { type: 'string', description: 'Optional. SMTP address of a mailbox to send AS — true Send As, no "on behalf of". Requires Exchange "Send As" permission on the target mailbox, granted server-side by an admin. Address must be resolvable by Exchange (typically same tenant). Without the permission, the send may bounce, downgrade to "on behalf of", or sit in the Outbox depending on tenant policy. Cannot be used to spoof external senders.' },
       },
     },
   },
@@ -981,6 +1034,7 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
         cc: args.cc || '',
         account: args.account,
         attachments,
+        sendAs: args.send_as || '',
       });
       return await ps(script);
     }
@@ -993,6 +1047,8 @@ if (-not $item) { Write-Output '{"error":"Email not found"}'; exit 0 }
       const safeAcct = String(args.account).replace(/'/g, "''");
       const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body)}</div>`, 'utf8').toString('base64');
       const replyAll = args.reply_all ? 'true' : 'false';
+      const sendAsBlock = buildSendAsBlock('$reply', args.send_as);
+      const safeSendAs = String(args.send_as || '').replace(/'/g, "''");
 
       return await ps(`
 ${INIT}
@@ -1012,8 +1068,9 @@ if (-not $matched) {
 }
 [System.Type]$t = $reply.GetType()
 [void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $reply, @($matched))
+${sendAsBlock}
 $reply.Send()
-Write-Output ('{"status":"sent","from":"' + $matched.SmtpAddress + '"}')
+Write-Output ('{"status":"sent","from":"' + $matched.SmtpAddress + '"${safeSendAs ? `,"sent_as":"${safeSendAs}"` : ''}}')
 `);
     }
 
@@ -1026,6 +1083,8 @@ Write-Output ('{"status":"sent","from":"' + $matched.SmtpAddress + '"}')
       const cc = (args.cc || '').replace(/'/g, "''");
       const safeAcct = String(args.account).replace(/'/g, "''");
       const htmlBodyB64 = Buffer.from(`<div>${textToHtml(args.body || '')}</div>`, 'utf8').toString('base64');
+      const sendAsBlock = buildSendAsBlock('$fwd', args.send_as);
+      const safeSendAs = String(args.send_as || '').replace(/'/g, "''");
 
       return await ps(`
 ${INIT}
@@ -1047,8 +1106,9 @@ if (-not $matched) {
 }
 [System.Type]$t = $fwd.GetType()
 [void]$t.InvokeMember('SendUsingAccount', [System.Reflection.BindingFlags]::SetProperty, $null, $fwd, @($matched))
+${sendAsBlock}
 $fwd.Send()
-Write-Output ('{"status":"sent","to":"${to}","from":"' + $matched.SmtpAddress + '"}')
+Write-Output ('{"status":"sent","to":"${to}","from":"' + $matched.SmtpAddress + '"${safeSendAs ? `,"sent_as":"${safeSendAs}"` : ''}}')
 `);
     }
 
@@ -1164,6 +1224,7 @@ module.exports = {
   buildDownloadScript,
   buildForceSyncScript,
   buildSendScript,
+  buildSendAsBlock,
   normalizeAttachmentPath,
   validateAttachments,
   validateAccountSelection,
