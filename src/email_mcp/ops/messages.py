@@ -24,9 +24,9 @@ from email_mcp.ops.accounts import resolve_validated_account
 from email_mcp.ops.attachments import validate_attachments
 from email_mcp.ops.sendas import apply_send_as
 from email_mcp.outlook.folders import all_mail_folders
-from email_mcp.outlook.session import OL_CLASS_MAIL
+from email_mcp.outlook.session import OL_CLASS_MAIL, OL_FOLDER_DRAFTS
 from email_mcp.query import compile_filter
-from email_mcp.text import text_to_html
+from email_mcp.text import marked_body_html, text_to_html
 
 # Default sort when order_by is unknown (mirrors ORDER_MAP.received_desc fallback).
 _DEFAULT_SORT: tuple[str, bool] = ORDER_MAP["received_desc"]
@@ -357,9 +357,15 @@ def send_email(
     account's SmtpAddress (falling back to the current user's address).
     """
     resolve_validated_account(session, account)
+    send_acct = _resolve_send_account(session, account)
     validated_attachments = validate_attachments(attachments)
 
-    item = session.app.CreateItem(0)
+    try:
+        drafts_folder = send_acct.DeliveryStore.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        item = drafts_folder.Items.Add("IPM.Note")
+    except Exception:
+        item = session.app.CreateItem(0)  # fallback for accounts without DeliveryStore (e.g. some POP3 setups)
+
     item.Subject = subject
     item.HTMLBody = f"<div>{text_to_html(body)}</div>"
     item.To = to
@@ -368,7 +374,6 @@ def send_email(
     for path in validated_attachments:
         item.Attachments.Add(path)
 
-    send_acct = _resolve_send_account(session, account)
     item.SendUsingAccount = send_acct
 
     try:
@@ -410,18 +415,23 @@ def draft_email(
     account's SmtpAddress (falling back to the current user's address).
     """
     resolve_validated_account(session, account)
+    send_acct = _resolve_send_account(session, account)
     validated_attachments = validate_attachments(attachments)
 
-    item = session.app.CreateItem(0)
+    try:
+        drafts_folder = send_acct.DeliveryStore.GetDefaultFolder(OL_FOLDER_DRAFTS)
+        item = drafts_folder.Items.Add("IPM.Note")
+    except Exception:
+        item = session.app.CreateItem(0)  # fallback for accounts without DeliveryStore (e.g. some POP3 setups)
+
     item.Subject = subject
-    item.HTMLBody = f"<div>{text_to_html(body)}</div>"
+    item.HTMLBody = marked_body_html(body)
     item.To = to
     if cc:
         item.CC = cc
     for path in validated_attachments:
         item.Attachments.Add(path)
 
-    send_acct = _resolve_send_account(session, account)
     item.SendUsingAccount = send_acct
 
     try:
@@ -446,6 +456,7 @@ def reply_email(
     account: str,
     reply_all: bool = False,
     send_as: str = "",
+    draft: bool = False,
 ) -> dict:
     """Reply (or reply-all) to an email. Ports the ``reply_email`` handler.
 
@@ -453,26 +464,44 @@ def reply_email(
     HTML body to the reply's existing HTMLBody, assigns ``SendUsingAccount``, applies
     ``send_as`` (if any) before sending.
 
-    Returns ``{status: 'sent', from[, sent_as]}``.
+    When ``draft`` is ``True``, calls ``reply.Save()`` instead of ``reply.Send()`` —
+    sibling of :func:`draft_email`'s send/draft split, but preserving the reply's
+    threading (In-Reply-To, quoted body, subject prefix) that a fresh ``draft_email``
+    call cannot reproduce. Outlook saves an unsent reply item to the account's Drafts
+    folder. ``send_as`` is skipped when drafting for the same reason ``draft_email``
+    skips it: it rewrites sender identity at submit time, so applying it to an item
+    that is never submitted would silently misrepresent the draft's actual sender.
+
+    Returns ``{status: 'sent', from[, sent_as]}`` when sent, or
+    ``{status: 'draft', entry_id, from}`` when drafted.
     """
     resolve_validated_account(session, account)
 
     item = session.get_item(entry_id)
     reply = item.ReplyAll() if reply_all else item.Reply()
-    reply.HTMLBody = f"<div>{text_to_html(body)}</div>" + reply.HTMLBody
+    block = marked_body_html(body) if draft else f"<div>{text_to_html(body)}</div>"
+    reply.HTMLBody = block + reply.HTMLBody
 
     send_acct = _resolve_send_account(session, account)
     reply.SendUsingAccount = send_acct
 
     try:
-        sent_from = str(send_acct.SmtpAddress)
+        from_addr = str(send_acct.SmtpAddress)
     except Exception:
-        sent_from = session.current_user_address()
+        from_addr = session.current_user_address()
+
+    if draft:
+        reply.Save()
+        try:
+            reply_entry_id = str(reply.EntryID)
+        except Exception:
+            reply_entry_id = ""
+        return {"status": "draft", "entry_id": reply_entry_id, "from": from_addr}
 
     apply_send_as(session, reply, send_as)
     reply.Send()
 
-    result: dict[str, Any] = {"status": "sent", "from": sent_from}
+    result: dict[str, Any] = {"status": "sent", "from": from_addr}
     if send_as:
         result["sent_as"] = send_as
     return result
@@ -486,6 +515,7 @@ def forward_email(
     cc: str = "",
     body: str = "",
     send_as: str = "",
+    draft: bool = False,
 ) -> dict:
     """Forward an email. Ports the ``forward_email`` handler.
 
@@ -494,7 +524,12 @@ def forward_email(
     HTML body to the forward's existing HTMLBody. Assigns ``SendUsingAccount``,
     applies ``send_as`` (if any) before sending.
 
-    Returns ``{status: 'sent', to, from[, sent_as]}``.
+    When ``draft`` is ``True``, calls ``fwd.Save()`` instead of ``fwd.Send()`` —
+    same send/draft split as :func:`reply_email`, and for the same reason ``send_as``
+    is skipped when drafting.
+
+    Returns ``{status: 'sent', to, from[, sent_as]}`` when sent, or
+    ``{status: 'draft', entry_id, to, from}`` when drafted.
     """
     resolve_validated_account(session, account)
 
@@ -504,20 +539,29 @@ def forward_email(
     if cc:
         fwd.CC = cc
     if body:
-        fwd.HTMLBody = f"<div>{text_to_html(body)}</div>" + fwd.HTMLBody
+        block = marked_body_html(body) if draft else f"<div>{text_to_html(body)}</div>"
+        fwd.HTMLBody = block + fwd.HTMLBody
 
     send_acct = _resolve_send_account(session, account)
     fwd.SendUsingAccount = send_acct
 
     try:
-        sent_from = str(send_acct.SmtpAddress)
+        from_addr = str(send_acct.SmtpAddress)
     except Exception:
-        sent_from = session.current_user_address()
+        from_addr = session.current_user_address()
+
+    if draft:
+        fwd.Save()
+        try:
+            fwd_entry_id = str(fwd.EntryID)
+        except Exception:
+            fwd_entry_id = ""
+        return {"status": "draft", "entry_id": fwd_entry_id, "to": to, "from": from_addr}
 
     apply_send_as(session, fwd, send_as)
     fwd.Send()
 
-    result: dict[str, Any] = {"status": "sent", "to": to, "from": sent_from}
+    result: dict[str, Any] = {"status": "sent", "to": to, "from": from_addr}
     if send_as:
         result["sent_as"] = send_as
     return result

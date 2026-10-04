@@ -1,4 +1,4 @@
-"""FastMCP server exposing the 11 Outlook email tools over stdio.
+"""FastMCP server exposing the 14 Outlook email tools over stdio.
 
 This is a thin pass-through layer. It owns a single :class:`OutlookWorker` (an
 STA thread that holds the live Outlook COM handle) and marshals every tool call
@@ -26,6 +26,7 @@ from email_mcp.errors import EmailMcpError
 from email_mcp.ops import accounts as accounts_ops
 from email_mcp.ops import attachments as attachments_ops
 from email_mcp.ops import calendar as calendar_ops
+from email_mcp.ops import drafts as drafts_ops
 from email_mcp.ops import messages as messages_ops
 from email_mcp.ops import sync as sync_ops
 from email_mcp.outlook.session import OutlookSession
@@ -91,18 +92,45 @@ _DRAFT_EMAIL_DESC = (
     "Compose a new email and save it as a draft instead of sending. Same parameters as send_email "
     "(minus send_as, which is meaningless on an item that's never submitted). The draft lands in the "
     "account's Drafts folder for later review/editing/sending from Outlook itself. Returns entry_id so "
-    "the draft can be read/edited/sent later."
+    "the draft can be read/edited/sent later. To revise a draft you already created, use edit_draft "
+    "with its entry_id instead of drafting again; use delete_draft to discard one."
+)
+
+_EDIT_DRAFT_DESC = (
+    "Edit an unsent draft in place (from draft_email, or reply_email/forward_email with draft=true). "
+    "Pass only the fields to change: to, cc, subject, body, attachments_add (absolute paths), "
+    "attachments_remove (filenames). `body` replaces the text written by this server and keeps the "
+    "quoted thread on reply/forward drafts. Prefer this over creating a new draft when revising, so "
+    "Drafts does not fill up. Refuses anything that is not an unsent draft. Returns the draft's "
+    "entry_id (use the returned one) and what changed."
+)
+
+_DELETE_DRAFT_DESC = (
+    "Delete an unsent draft by entry_id. Moves it to Deleted Items (recoverable), never a permanent "
+    "purge. Refuses anything that is not an unsent draft, so sent/received mail cannot be deleted "
+    "with this tool."
+)
+
+_LIST_DRAFTS_DESC = (
+    "List unsent drafts, newest-modified first, with entry_id, account, to, cc, subject, modified, "
+    "has_attachments and a preview. Use it to find a draft to edit_draft/delete_draft, or to clean up "
+    "stale ones. Optional `account` substring limits to one mailbox."
 )
 
 _REPLY_EMAIL_DESC = (
-    "Reply to an email. The `account` parameter is REQUIRED to prevent accidental cross-account replies. "
-    "Use the optional `send_as` parameter for true Send As (see send_email for the full constraints)."
+    "Reply to an email. SENDS IMMEDIATELY by default — pass `draft=true` to save the reply to the "
+    "account's Drafts folder instead, for cases (e.g. user asked to draft, not send) where the reply "
+    "needs review before it goes out. A drafted reply keeps threading (In-Reply-To, quoted body, subject "
+    "prefix) that composing a new draft_email cannot reproduce. The `account` parameter is REQUIRED to "
+    "prevent accidental cross-account replies. `send_as` only applies when sending (ignored when drafting "
+    "— see send_email for the full constraints)."
 )
 
 _FORWARD_EMAIL_DESC = (
-    "Forward an email. Preserves the original subject (FW:), quoted body, and attachments. The `account` "
-    "parameter is REQUIRED to prevent accidental cross-account forwards. Use the optional `send_as` "
-    "parameter for true Send As (see send_email for the full constraints)."
+    "Forward an email. Preserves the original subject (FW:), quoted body, and attachments. SENDS "
+    "IMMEDIATELY by default — pass `draft=true` to save the forward to the account's Drafts folder instead "
+    "of sending it. The `account` parameter is REQUIRED to prevent accidental cross-account forwards. "
+    "`send_as` only applies when sending (ignored when drafting — see send_email for the full constraints)."
 )
 
 _DOWNLOAD_ATTACHMENTS_DESC = (
@@ -203,6 +231,40 @@ async def draft_email(
     )
 
 
+@mcp.tool(description=_EDIT_DRAFT_DESC)
+async def edit_draft(
+    entry_id: str,
+    to: str | None = None,
+    cc: str | None = None,
+    subject: str | None = None,
+    body: str | None = None,
+    attachments_add: list[str] | None = None,
+    attachments_remove: list[str] | None = None,
+) -> str:
+    return await _call(
+        lambda s: drafts_ops.edit_draft(
+            s,
+            entry_id=entry_id,
+            to=to,
+            cc=cc,
+            subject=subject,
+            body=body,
+            attachments_add=attachments_add,
+            attachments_remove=attachments_remove,
+        )
+    )
+
+
+@mcp.tool(description=_DELETE_DRAFT_DESC)
+async def delete_draft(entry_id: str) -> str:
+    return await _call(lambda s: drafts_ops.delete_draft(s, entry_id))
+
+
+@mcp.tool(description=_LIST_DRAFTS_DESC)
+async def list_drafts(account: str = "", limit: int = 20) -> str:
+    return await _call(lambda s: drafts_ops.list_drafts(s, account=account, limit=limit))
+
+
 @mcp.tool(description=_REPLY_EMAIL_DESC)
 async def reply_email(
     entry_id: str,
@@ -210,6 +272,7 @@ async def reply_email(
     account: str,
     reply_all: bool = False,
     send_as: str = "",
+    draft: bool = False,
 ) -> str:
     return await _call(
         lambda s: messages_ops.reply_email(
@@ -219,6 +282,7 @@ async def reply_email(
             account=account,
             reply_all=reply_all,
             send_as=send_as,
+            draft=draft,
         )
     )
 
@@ -231,6 +295,7 @@ async def forward_email(
     cc: str = "",
     body: str = "",
     send_as: str = "",
+    draft: bool = False,
 ) -> str:
     return await _call(
         lambda s: messages_ops.forward_email(
@@ -241,6 +306,7 @@ async def forward_email(
             cc=cc,
             body=body,
             send_as=send_as,
+            draft=draft,
         )
     )
 

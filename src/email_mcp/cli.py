@@ -1,7 +1,7 @@
 """Typer CLI adapter for email-mcp.
 
-One subcommand per tool (11: list-accounts, query, read, send, draft, reply,
-forward, download, mark-read, sync, calendar) plus ``mcp`` (which hands off to
+One subcommand per tool (14: list-accounts, query, read, send, draft, draft-edit,
+draft-delete, drafts, reply, forward, download, mark-read, sync, calendar) plus ``mcp`` (which hands off to
 the MCP server). Each
 tool command opens a single :class:`email_mcp.outlook.session.OutlookSession`,
 delegates to the matching function in :mod:`email_mcp.ops`, and prints the result
@@ -23,6 +23,7 @@ from email_mcp.errors import EmailMcpError
 from email_mcp.ops import accounts as ops_accounts
 from email_mcp.ops import attachments as ops_attachments
 from email_mcp.ops import calendar as ops_calendar
+from email_mcp.ops import drafts as ops_drafts
 from email_mcp.ops import messages as ops_messages
 from email_mcp.ops import sync as ops_sync
 from email_mcp.outlook.session import OutlookSession
@@ -163,6 +164,52 @@ def draft_cmd(
     )
 
 
+@app.command("draft-edit")
+def draft_edit_cmd(
+    entry_id: str = typer.Argument(..., help="EntryID of the draft."),
+    to: Optional[str] = typer.Option(None, "--to", help="Replace recipient(s)."),
+    cc: Optional[str] = typer.Option(None, "--cc", help="Replace CC (empty string clears)."),
+    subject: Optional[str] = typer.Option(None, "--subject", help="Replace subject."),
+    body: Optional[str] = typer.Option(None, "--body", help="Replace plain-text body."),
+    attach: Optional[list[str]] = typer.Option(
+        None, "--attach", help="Attachment file path to add (repeatable)."
+    ),
+    detach: Optional[list[str]] = typer.Option(
+        None, "--detach", help="Attachment filename to remove (repeatable)."
+    ),
+) -> None:
+    """Edit an unsent draft in place (only the flags you pass change)."""
+    _run(
+        lambda s: ops_drafts.edit_draft(
+            s,
+            entry_id=entry_id,
+            to=to,
+            cc=cc,
+            subject=subject,
+            body=body,
+            attachments_add=attach,
+            attachments_remove=detach,
+        )
+    )
+
+
+@app.command("draft-delete")
+def draft_delete_cmd(
+    entry_id: str = typer.Argument(..., help="EntryID of the draft."),
+) -> None:
+    """Delete an unsent draft (moved to Deleted Items)."""
+    _run(lambda s: ops_drafts.delete_draft(s, entry_id))
+
+
+@app.command("drafts")
+def drafts_cmd(
+    account: str = typer.Option("", "--account", help="Account name substring."),
+    limit: int = typer.Option(20, "--limit", help="Max drafts to return."),
+) -> None:
+    """List unsent drafts, newest first."""
+    _run(lambda s: ops_drafts.list_drafts(s, account=account, limit=limit))
+
+
 @app.command("reply")
 def reply_cmd(
     entry_id: str = typer.Argument(..., help="EntryID of the email to reply to."),
@@ -170,6 +217,7 @@ def reply_cmd(
     account: str = typer.Option(..., "--account", help="Sending account substring."),
     reply_all: bool = typer.Option(False, "--reply-all", help="Reply to all recipients."),
     send_as: str = typer.Option("", "--send-as", help="SMTP address to send AS."),
+    draft: bool = typer.Option(False, "--draft", help="Save to Drafts instead of sending."),
 ) -> None:
     """Reply to an email."""
     _run(
@@ -180,6 +228,7 @@ def reply_cmd(
             account=account,
             reply_all=reply_all,
             send_as=send_as,
+            draft=draft,
         )
     )
 
@@ -192,6 +241,7 @@ def forward_cmd(
     cc: str = typer.Option("", "--cc", help="CC address(es)."),
     body: str = typer.Option("", "--body", help="Optional plain-text body to prepend."),
     send_as: str = typer.Option("", "--send-as", help="SMTP address to send AS."),
+    draft: bool = typer.Option(False, "--draft", help="Save to Drafts instead of sending."),
 ) -> None:
     """Forward an email."""
     _run(
@@ -203,6 +253,7 @@ def forward_cmd(
             cc=cc,
             body=body,
             send_as=send_as,
+            draft=draft,
         )
     )
 
